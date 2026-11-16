@@ -40,7 +40,7 @@ python events.py read --chain base --contract "$TOKEN" --from-block 100 --to-blo
 
 ## Selector、标准 ABI 与歧义
 
-支持 `erc20`、`erc721`、`erc1155`、`weth`、`erc4626`、`uniswap_v2_router`、`dex_v2_pair`、`uniswap_v3_pool`、`pancake_v3_pool` 内置 ABI，所有现有接受 `abi` 的接口均可使用这些名称。
+支持 `erc20`、`erc721`、`erc1155`、`weth`、`erc4626`、`uniswap_v2_router`、`dex_v2_pair`、`uniswap_v3_pool`、`pancake_v3_pool`、`delegation_manager`、`erc1271` 内置 ABI，所有现有接受 `abi` 的接口均可使用这些名称。
 
 ```bash
 python contract.py functions --abi erc721
@@ -321,9 +321,10 @@ python transaction.py analyze --describe
 python transaction.py plan --describe
 python address.py history --describe
 python address.py actions --describe
+python raw.py patch --describe
 ```
 
-这四项机器帮助不读取配置、不加载私钥、不联网，输出用途/禁用场景、JSON 参数 schema、必填/默认值、稳定字段和成本影响因素。chain 仍必须显式提供；耗时和请求量是条件相关估计，不承诺固定 3–8 秒。
+这五项机器帮助不读取配置、不加载私钥、不联网，输出用途/禁用场景、JSON 参数 schema、必填/默认值、稳定字段和成本影响因素。chain 仍必须显式提供；耗时和请求量是条件相关估计，不承诺固定 3–8 秒。
 
 ## 地址历史与 actions
 
@@ -350,9 +351,102 @@ python transaction.py plan --chain bsc --hash "$TX_HASH" --wallet trading --abi 
 
 第一例是 ERC-20 transfer 的最小单位简写，第二例是 Router 的明确参数名。override.args 支持完整数组或唯一顶层名称对象；tuple/数组参数通过完整顶层值替换，value_wei 单独覆盖。amount 简写只接受能唯一确定主要输入的标准接口，歧义或重复覆盖拒绝。
 
-沿用 template_safe 规则，只有显式/已确认 ABI 才可编辑参数；已确认标准受益人改为选定钱包并展示 parameter_diff，显式 override 可覆盖。owner、钱包绑定证明/签名、deadline 不自动重写，未知 calldata 只原样模拟。源码/接口模式未确认时可明确传 ABI/signature，不将猜测直接转为可执行模板。
+沿用 template_safe 规则，只有显式/已确认 ABI 才可编辑参数；已确认标准受益人改为选定钱包并展示 parameter_diff，显式 override 可覆盖。owner、钱包绑定证明/签名、deadline 不自动重写；显式 deadline 覆盖单独处理，未知 calldata 默认原样或经显式字段映射改写后强制模拟。源码/接口模式未确认时可明确传 ABI/signature，不将猜测直接转为可执行模板。
 
 输出 template、parameter_diff、preview、source_status、template_safe 和 warnings。实时读取 pending Nonce、余额、费用并模拟、估价，不复制原 Nonce/Gas/费用，不预留 Nonce，不写广播意图。使用观察钱包地址也能预览；若仅配置私钥变量则在本地派生地址，绝不输出或外传密钥。此命令不接受 execute/skip_simulation/nonce，不能广播。模拟或余额检查失败时 ok=false、data.status=blocked，仍保留 template/diff 和 suggested_next。
+
+## 内部原始 input 与输出开关
+
+```bash
+python transaction.py analyze --chain sepolia --hash "$TX_HASH" --view full --include-inputs
+```
+
+每个内部/声明调用都有 selector、input_bytes、input_available。input_bytes 包括 4 字节 selector；676 字节对应 1352 个 hex 字符，不含 0x。缺失为 null，不伪造 0x；真正空输入才是 input_bytes=0。原始数据不截断。
+
+默认返回不包含内部 input/input_raw；--include-inputs 才同时打开 input_raw 与旧 input 别名。这是明确的输出变更，旧客户端需加开关。默认 full 的顶层 inspection 仍保留原始交易。summary 与 include-inputs 冲突并报参数错误；不会以超出 2KB 的摘要偷偷携带 calldata。
+
+开关只控制投影，内部分析和本地快照仍保存原始 trace。include-inputs/full/summary 共享快照；缓存版本已更新，不删除原有状态记录。path/call_path/field_path 使用整数数组，不能把交易内序号、区块日志索引和路径混用。
+
+## 7702 上下文与已知协议解包
+
+`classification.type=eip7702_delegated_execution` 包含 delegator/delegators、manager、confidence、status、evidence_scope、authorization_intents、delegation_accounts 和 requires_original_authorization_context。普通已委托 EOA 发送一笔 approve，并不自动意味着执行了委托代码。
+
+优先使用参与执行账户的 prestate 代码标记和真实 trace；必要时增加一次带代码的 prestate 查询，并在地址/请求预算内补查候选。区块末/浏览器当前证据降级，签名授权仅证明授权意图，不证明当时 nonce/代码条件校验成功。若授权列表可能改变同一账户的 prestate 委托指针，也保守降为 candidate，不把旧代码当执行实现。多个账户不擅自挑一个，单纯 ERC-1271/ecrecover/selector 不足以确认 7702。可用 evidence_scope/status 区分 observed 与 candidate，不把 from 固定当 delegator。[EIP-7702](https://eips.ethereum.org/EIPS/eip-7702)、[ERC-1271](https://eips.ethereum.org/EIPS/eip-1271)
+
+链配置可添加 delegation_managers 地址数组；默认 Sepolia 包含本次提供的公开管理器，其他链须明确配置，不跨链推断。识别 `redeemDelegations(bytes[],bytes32[],bytes[])` / 0xcef6d209；仅对已配置地址、规范 ABI 数组和受支持的全零 mode 解包。
+
+single CALL 的 executionCalldata 按 20 字节 target、32 字节 value、后续 calldata 读取，不扫描任意字节找 selector。这些结果放 declared_calls，source=encoded_execution、execution_index 从 0 开始、execution_observed=false、committed=null、path=null，不与真实 internal_calls 或 fund_flows 合并。其他模式/不完整 payload 标为 unsupported/partial，不按同一布局猜读。[ERC-7579 执行编码](https://eips.ethereum.org/EIPS/eip-7579)、[DelegationManager 接口](https://github.com/MetaMask/delegation-framework/blob/main/src/interfaces/IDelegationManager.sol)
+
+外层已知管理器的 plan 返回 CONTEXT_DEPENDENT_CALL，保留候选模板，提示选择业务调用。不能因为 outer eth_call 未 revert 就认为普通钱包复现了原授权流程；本版不创建授权、不重新签名。
+
+## take-call：选择实际或声明的业务 CALL
+
+```bash
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading \
+  --take-call "$CONTRACT:$SELECTOR" --abi uniswap_v2_router \
+  --override '{"recipient":"self","deadline":"now+1800"}'
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading --take-call 'path:0.1.2'
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading --take-call 'execution:0'
+```
+
+完整地址:selector 在完整 callTracer 中匹配；多个结果返回候选，不取第一条。trace 截断时必须指定已知 path；无 trace 时仅可从完整的已知协议声明匹配，亦可显式 execution:N。path 是根 [] 下的零基数组路径，execution:N 是声明索引，二者不能互冒。
+
+只允许普通非预编译 CALL；reverted、DELEGATECALL、CALLCODE、STATICCALL、CREATE 不转换。声明来源须有成功来源回执，但仍不标为真实 trace 执行证据。目标、value、calldata 来自所选调用，不复制外层总 value；ABI/signature 也只用于该调用，避免拿 swap ABI 去解外层 manager。
+
+原调用者/上下文保留在 source_call 和 template.source；声明无法确定的原调用者为 null，不猜成交易 from。实际模拟始终从选定钱包发起，simulation_context 即使失败也保留，不冒用原合约身份。失败时 simulation.details 保留 RPC 已脱敏的 revert data/可用解码，不保证每个 RPC 拒绝都能区分出具体合约原因。
+
+### 语义改写与 field_map
+
+recipient=self 或完整地址，deadline=整数秒或 now+正整数。可靠 ABI 下递归定位唯一 recipient/to/receiver 地址字段与 deadline/expiry/validUntil 无符号字段；多个候选须改为明确参数替换，不随机选择。与 override.args 重复覆盖同一字段拒绝，owner/签名/证明不自动重写。
+
+无可靠 ABI 时须显式提供 field_map，例如下面仅说明语法，不能照搬为任意函数的真实位置：
+
+```json
+{
+  "recipient": {"word": 6, "type": "address"},
+  "deadline": {"word": 5, "type": "uint256", "unit": "seconds"}
+}
+```
+
+映射只支持 selector 后完整 word，两个字段不能重叠，不支持 packed 或动态偏移猜测。确认 ABI 编辑与原始映射二选一；映射不提升 template_safe，始终 payload_unverified=true，当前模拟失败仍保留模板和 word diff。直接改动有效期可能破坏签名覆盖，工具不会补签。
+
+## timing：过期参数不静默复用
+
+分析输出 timing.reference_timestamp、clock_source、fields[]；每项包含 field_path/name/raw/type、deadline、expired、expires_in_s、unit、semantic_source/confidence。秒数以整数串保留；field_path 为嵌套参数索引数组。
+
+分析用明确标注的 local_utc_clock，缓存命中也重新计算 timing 和 DEADLINE_EXPIRED 风险，不额外联网。它是当前时钟下的提示，不是某个合约执行结果。plan 在需要检查/修改时间时读取 latest_block_timestamp，now+1800 以该值计算；获取链时钟失败时拒绝相对时间，不猜一个基准。
+
+只对已解析 ABI 的名字/类型或明确字段映射注释；不在未知 bytes 里扫描类似时间戳的大整数。普通命名采用秒的显式假设；零、最大值或疑似毫秒等特殊/单位不明值保留 unknown/null，不无依据称永久有效。已知 V2 Router 的 deadline 按标准模式解释。过去时间标风险，时间相等时 expires_in_s=0；真实边界和是否执行检查仍以代码和模拟为准。
+
+## raw.patch：整 word 改写后强制 eth_call
+
+```bash
+python raw.py patch --chain sepolia --to "$CONTRACT" --address "$OWNER" \
+  --data "$CALLDATA" --word 6 --type address --value "$RECIPIENT" --verify
+python raw.py patch --describe
+```
+
+word 从 selector 后第一格的 0 开始，byte_offset=4+word×32。--type address 左补零到 32 字节；uint256 接受十进制整数或 hex 数量，检查范围；默认 bytes32 必须正好 32 字节，不能把 20 字节值暗自当地址。只替换已存在的完整 word，不改 selector、不插入/删除、不补齐半个尾部 word。
+
+必须 verify=true 并提供 chain、to、wallet 或公开 address（二选一）；value 是被改的 word，value_wei 是模拟发送的原生币。使用 pending 状态 eth_call，成功只代表该调用未 revert，不证明 ABI、业务意图或未来上链安全。始终 payload_unverified=true，保留 data、parameter_diff、verification、标准 template。失败 ok=false/status=blocked，仍保留候选数据和 details；此命令不接受 execute，绝不签名广播。
+
+带 payload_unverified 的模板交给 raw.write 后仍保留该标记和警告，并按原交易引擎再次实时模拟。CLI/SDK 使用公开 address 时不需要加载私钥。
+
+## refunds：回流是净额的子集
+
+fund_flows.refunds[] 记录 asset_type、address、amount_raw/amount_readable、from/to、kind/confidence/evidence 和 source。receipt_position 为交易内零基位置，log_index 是区块级索引；native 使用 call_path，不混淆编号。
+
+已知标准退款可标 confirmed_refund；同资产先流出再从原对端或已生效路径收到、且候选回流合计不超过流出时，列为 refund_candidate。金额小不是依据；先借后还、空投、回款大于支出的收益不自动称退款。未知 ABI 的 WETH 微量回流也只能称疑似找零，不改变其精确数量。
+
+refunds 已包含在 tokens.in/net 或 native.received_wei/net_wei，不再扣一次；native.refund_wei 继续只填已确认退款。历史 decimals 查不到时 amount_readable=null，不能拿当前元数据或 18 位假设冒充历史事实。summary 带 refund_count 和可裁剪的紧凑条目，仍限制 2KB。
+
+## 本轮 Sepolia 只读验收
+
+四笔公开样本均完成只读检查：委托外层能解包一条完整 676 字节的声明调用；它与直接兑换样本的 calldata 仅第 5、6 个 word 不同。两笔配套授权的 gasUsed 均为 128298。无 trace 时保留声明来源，未声称已验证真实第三层路径。
+
+兑换样本的回流精确保留为 40555791 raw，交易内 receipt_position=7，区块 log_index=74，标为 refund_candidate；该公共节点拒绝历史精度查询，故 amount_readable=null。缓存摘要实测 1580 字节，禁用网络后仍可命中并刷新时间提示。
+
+外层复现被 CONTEXT_DEPENDENT_CALL 拦截；内层显式映射生成了候选参数差异，但当前 eth_call 与 raw.patch 校验均返回 CALL_REVERTED，结果正确为 blocked。这证明失败数据交付与拦截路径有效，不代表当前状态可成功复现。全过程未签名、未广播；样本明细和临时测试不加入仓库。
 
 ## 本地缓存与强制刷新
 

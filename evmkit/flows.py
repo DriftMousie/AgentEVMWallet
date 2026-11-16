@@ -12,7 +12,8 @@ def fund_flows(analyzer, transaction, receipt, internals, changes):
     trace_complete = internals.get("source") == "rpc.callTracer" and internals.get("complete") is True
     complete_native = canonical_ok and receipt is not None and (failed or trace_complete)
     spent,received = 0,0
-    for row in internals.get("calls",[]) if not failed else []:
+    legs=[]
+    for order,row in enumerate(internals.get("calls",[]) if not failed else []):
         if row.get("committed") is not True or not row.get("may_carry_value"): continue
         source = address(row["from"]) if row.get("from") else None
         destination = address(row["to"]) if row.get("to") else None
@@ -20,6 +21,9 @@ def fund_flows(analyzer, transaction, receipt, internals, changes):
         value = int(row.get("value_wei") or 0)
         if source == focus: spent += value
         if destination == focus: received += value
+        if value>0 and focus in (source,destination):
+            legs.append({"asset_type":"native","address":None,"from":source,"to":destination,"amount_raw":str(value),
+                         "order":order,"direction":"out" if source==focus else "in","call_path":row.get("path"),"source":"rpc.callTracer"})
     fee = int(analyzer.inspection.get("execution_fee_paid_wei") or 0) if receipt and address(transaction["from"]) == focus else 0
     net = spent-received if complete_native else None
     actual_delta = next((r["delta_raw"] for r in changes.get("native_transaction",[]) if address(r["address"]) == focus),None) if canonical_ok else None
@@ -42,7 +46,7 @@ def fund_flows(analyzer, transaction, receipt, internals, changes):
     layouts = [item for abi in (ERC20,ERC721,ERC1155) for item in abi
                if item.get("type")=="event" and item["name"] in ("Transfer","TransferSingle","TransferBatch")]
     logs = receipt.get("logs",[]) if receipt else []
-    for raw in logs[:analyzer.options["max_frames"]] if receipt and not failed else []:
+    for position,raw in enumerate(logs[:analyzer.options["max_frames"]] if receipt and not failed else []):
         args,event = None,None
         for item in layouts:
             try: args=analyzer.decode_event_item(raw,item);event=item["name"];break
@@ -60,6 +64,11 @@ def fund_flows(analyzer, transaction, receipt, internals, changes):
             row=tokens.setdefault(location,{"address":location,"in":0,"out":0})
             if destination==focus: row["in"]+=int(args["value"])
             if source==focus: row["out"]+=int(args["value"])
+            if source!=destination and int(args["value"])>0:
+                index=raw.get("logIndex")
+                if isinstance(index,str): index=int(index,16) if index.startswith("0x") else int(index)
+                legs.append({"asset_type":"erc20","address":location,"from":source,"to":destination,"amount_raw":str(args["value"]),
+                             "order":position,"direction":"out" if source==focus else "in","receipt_position":position,"log_index":index,"source":"receipt.Transfer"})
         else:
             ids = args.get("ids",[args.get("tokenId",args.get("id"))])
             quantities = args.get("values",[args.get("value",1)])
@@ -85,7 +94,24 @@ def fund_flows(analyzer, transaction, receipt, internals, changes):
     for row in token_rows+nft_rows:
         value=int(row["net"])
         row["role"]="received" if value>0 else "payment" if value<0 and positive else "sent" if value<0 else "mixed"
-    return {"focus_address":focus,"native":native,"tokens":token_rows,"nfts":nft_rows,
+    refunds=[]
+    participants={r.get(key) for r in internals.get("calls",[]) if r.get("committed") is True for key in ("from","to")}
+    for asset in dict.fromkeys((r["asset_type"],r["address"]) for r in legs):
+        outgoing=[r for r in legs if (r["asset_type"],r["address"])==asset and r["direction"]=="out"]
+        incoming=[r for r in legs if (r["asset_type"],r["address"])==asset and r["direction"]=="in"]
+        eligible=[r for r in incoming if any(o["order"]<r["order"] and (o["to"]==r["from"] or r["from"] in participants and o["to"] in participants) for o in outgoing)]
+        if not eligible or sum(int(r["amount_raw"]) for r in eligible)>sum(int(r["amount_raw"]) for r in outgoing):continue
+        for leg in eligible:
+            confirmed=asset[0]=="native" and native["refund_wei"] is not None and leg["from"]==transaction.get("to")
+            meta=next((r for r in token_rows if r["address"]==asset[1]),{}) if asset[0]=="erc20" else native
+            decimals=meta.get("decimals");symbol=meta.get("symbol") or "?"
+            from .common import formatted
+            refunds.append({k:v for k,v in leg.items() if k not in ("order","direction")} | {
+                "kind":"confirmed_refund" if confirmed else "refund_candidate","confidence":"high" if confirmed else "medium" if trace_complete else "low",
+                "symbol":symbol,"decimals":decimals,"amount_readable":formatted(int(leg["amount_raw"]),decimals)+" "+symbol if decimals is not None else None,
+                "evidence":["same_asset","outflow_before_inflow","same_counterparty_or_committed_route"],
+                "included_in":"native.received_wei/net_wei" if asset[0]=="native" else "tokens.in/net"})
+    return {"focus_address":focus,"native":native,"tokens":token_rows,"nfts":nft_rows,"refunds":refunds,
             "status":"complete" if native["status"]=="complete" and asset_complete else "partial",
             "tokens_status":"complete" if asset_complete else "partial",
             "confidence":"event_and_trace_derived" if complete_native else "logs_derived",

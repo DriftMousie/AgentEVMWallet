@@ -8,6 +8,15 @@ def suggested_next(params, data=None, code=None):
     data=data if isinstance(data,dict) else {}
     chain,hash_=params.get("chain"),params.get("hash")
     steps=[]
+    if code in ("CONTEXT_DEPENDENT_CALL","CALL_SELECTION_AMBIGUOUS","CALL_NOT_FOUND","CALL_INPUT_UNAVAILABLE","CALL_CONTEXT_UNSUPPORTED"):
+        steps.append({"action":"inspect_call_candidates","path":"data.candidates" if data.get("candidates") else "data.source_call",
+                      "reason":"Choose an ordinary business CALL using its exact trace path or declared execution index; never automatically choose the first match or copy authorization context"})
+    if code in ("CALL_TRACE_UNAVAILABLE","CALL_SELECTION_INCOMPLETE","CALL_INPUT_UNAVAILABLE","CALL_NOT_FOUND","CONTEXT_DEPENDENT_CALL") and chain and hash_:
+        steps.append({"module":"transaction","operation":"analyze","params":{"chain":chain,"hash":hash_,"view":"full","include_inputs":True},
+                      "reason":"Inspect available raw calls and distinguish observed traces from encoded declarations"})
+    if code in ("ABI_REQUIRED","FIELD_SELECTION_AMBIGUOUS"):
+        steps.append({"module":"transaction","operation":"plan","params":{"describe":True},
+                      "reason":"Provide a confirmed ABI or an explicitly established typed field_map; do not guess offsets, recipients or time units"})
     inspected=data.get("inspection",{})
     tx=inspected.get("transaction",{})
     decoded=data.get("input_decode",data.get("decoded",{})) or {}
@@ -57,6 +66,7 @@ def summary_envelope(response):
     classification=original.get("classification",{})
     inferred=classification.get("inferred_intent") or {}
     tokens=flows.get("tokens",[]);nfts=flows.get("nfts",[])
+    refunds=flows.get("refunds",[])
     decoded=original.get("input_decode",{})
     unknowns=[]
     if native.get("status")=="partial": unknowns.append("native_flow:"+native.get("reconciliation","incomplete"))
@@ -88,7 +98,8 @@ def summary_envelope(response):
                         "native":{k:native.get(k) for k in ("net_wei","fee_wei","balance_delta_wei")},
                         "tokens":[{k:r.get(k) for k in ("address","decimals","net","role")} for r in tokens],
                         "nfts":[{k:r.get(k) for k in ("address","token_id","net")} for r in nfts]},
-          "token_count":len(tokens),"nft_count":len(nfts),"risk_count":len(risks),"unknowns_count":len(unknowns),
+          "token_count":len(tokens),"nft_count":len(nfts),"risk_count":len(risks),"unknowns_count":len(unknowns),"refund_count":len(refunds),
+          "refunds":[{k:r.get(k) for k in ("address","amount_raw","kind")} for r in refunds],
           "risks":[{"code":r["code"],"severity":r.get("severity")} for r in risks],"unknowns":unknowns,
           "next":"Inspect full fund_flows, risks and unknowns before reusing calldata", "truncated":False,
           "cached":original.get("cached",False),"analyzed_at":original.get("analyzed_at")}
@@ -97,7 +108,7 @@ def summary_envelope(response):
     out={**response,"wallet":None,"data":body,"warnings":[],"error":error}
     def size():return len((json.dumps(out,ensure_ascii=False,separators=(",",":"))+"\n").encode("utf-8"))
     if error: error["message"]=str(error.get("message", ""))[:160];error["suggested_next"]=[{"action":"inspect_error_and_full_view"}]
-    buckets=[body["fund_flows"]["tokens"],body["fund_flows"]["nfts"],body["unknowns"],body["risks"]]
+    buckets=[body["refunds"],body["fund_flows"]["tokens"],body["fund_flows"]["nfts"],body["unknowns"],body["risks"]]
     while size()>2048:
         body["truncated"]=True
         if body["net"] is not None or body["got"] is not None:
@@ -107,7 +118,7 @@ def summary_envelope(response):
         body["fee"]=None
         if error: error["message"]="See full view for error details"
         if size()>2048:
-            body={k:body[k] for k in ("view","status","analysis_status","intent","risk_count","unknowns_count","token_count","nft_count","truncated","next")}
+            body={k:body[k] for k in ("view","status","analysis_status","intent","risk_count","unknowns_count","token_count","nft_count","refund_count","truncated","next")}
             out["data"]=body
         break
     return out

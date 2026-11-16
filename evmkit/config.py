@@ -107,6 +107,9 @@ class Config:
         cfg.setdefault("fee_mode", "auto")
         if cfg.get("wrapped_native_address"):
             cfg["wrapped_native_address"]=address(cfg["wrapped_native_address"],field=f"chains.{name}.wrapped_native_address")
+        if "delegation_managers" in cfg:
+            require(isinstance(cfg["delegation_managers"],list),"delegation_managers must be an array","CONFIG_ERROR")
+            cfg["delegation_managers"]=[address(v,field=f"chains.{name}.delegation_managers") for v in cfg["delegation_managers"]]
         require(cfg["fee_mode"] in ("auto", "legacy", "eip1559"), "Invalid fee mode", "CONFIG_ERROR")
         require(0 <= cfg["decimals"] <= 255 and cfg["confirmations"] >= 1, "Invalid chain settings", "CONFIG_ERROR")
         return cfg

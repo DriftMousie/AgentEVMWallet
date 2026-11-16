@@ -229,3 +229,15 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 - 扩展本地缓存为分析快照与按区块哈希隔离的 metadata；完整增强 300 秒、部分 60 秒，pending/重组不存快照；no-cache 强制刷新，plan 的当前状态不缓存。
 - analyze/plan/history/actions 增加静态 --describe，不依赖配置或网络。13 个入口、全部 Markdown 与 Skill 同步。gulltoppr 独立后续处理，未纳入本轮。
 - 实测缓存摘要 1398 字节并验证零网络，冷分析 34 HTTP/37 RPC。公共节点这次历史读取返回鉴权/权限拒绝且不支持 trace，公共历史 API 也返回鉴权错误，均如实返回，不宣称能力已完整；开发测试/真实交易材料不加入仓库。
+
+
+## 13. 原始数据、委托执行与内层复现增强
+
+- analyze 增加 include-inputs；默认内部 input 不返回，selector/input_bytes/input_available/path 常驻。原始 input_raw/兼容 input 仅 full 显式打开，不截断；summary 冲突报错。缓存仍存完整数据，输出开关共享新版本快照。
+- 加入 DelegationManager/ERC-1271 模式和链级管理器配置。7702 组合代码、prestate、trace、授权意图等证据，区分历史范围、candidate/observed，不把普通签名验证或已委托发送者等同于实际委托执行。
+- 已知管理器全零 ERC-7579 single CALL 解包到独立 declared_calls，无 trace 也可提供声明中的目标/value/完整 payload；不伪造 path/执行状态，不计入资金流。外层照抄默认阻止。
+- plan.take-call 支持完整地址:selector、精确 path、execution:N；多匹配拒绝，partial trace 不自动取第一条。只取普通已生效 CALL 或明确受支持声明，从自己的钱包实时模拟；ABI 作用于选中调用。
+- 语义 recipient/self、deadline/now+秒在可靠 ABI 或明确 typed field_map 下实现。按完整 word 的未知映射标 payload_unverified，强制模拟；不猜 packed/dynamic 结构，不自动改 owner/证明/签名。
+- timing 识别明确时间字段，分析按本机 UTC、缓存命中重算；plan 相对时间使用最新区块。特殊值/未知单位不猜，过期标风险，不直接丢掉原始数据。
+- raw.patch 只替换 selector 后零基 word，显式 address/uint256/bytes32，必须 verify 和完整上下文；无 execute，不广播，失败保留 diff/data/revert details。
+- fund_flows.refunds 单列 confirmed/refund_candidate，附交易内位置与区块日志索引，不凭微小数量判断，不重复扣 net。全部 Markdown、help/describe 同步；真实样本和测试只留临时目录，不发布用户交易/钱包材料。

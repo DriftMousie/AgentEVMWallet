@@ -77,7 +77,7 @@ TOML 的 `[rpc] csv_file = "rpc.csv"` 指定 CSV 路径，相对路径以 TOML �
 | `approve.py` | `allowance`、`set`、`revoke` |
 | `nft.py` | `info`、`balance-batch`、`transfer`、`transfer-batch`、`approve`、`revoke`、`mint` |
 | `events.py` | `read` |
-| `raw.py` | `encode`、`decode`、`call`、`write`、`template`、`reencode` |
+| `raw.py` | `encode`、`decode`、`patch`、`call`、`write`、`template`、`reencode` |
 | `signing.py` | `message`、`typed`、`verify-message`、`verify-typed` |
 | `batch.py` | `run` |
 
@@ -158,10 +158,10 @@ EIP-1559 链的 `fee_model` 为 `eip1559`，`fees` 包含 `maxFeePerGas` 和 `ma
 ### ABI 的选择
 
 - 标准 ERC-20 只读调用可不传 `--abi`：支持 `balanceOf(address)`、`allowance(address,address)`、`name()`、`symbol()`、`decimals()`、`totalSupply()`，函数名或完整签名均可。
-- 内置 ABI 包括 erc20、erc721、erc1155、weth、erc4626、uniswap_v2_router、dex_v2_pair、uniswap_v3_pool、pancake_v3_pool。`--abi erc20` 显式选择 ERC-20 ABI，不访问外部网站、不依赖工作目录中的 ABI 文件。包含常用查询、transfer/approve/transferFrom 和 Transfer/Approval 事件，可用于函数列表、编解码、合约调用、交易解析和事件解码等现有 ABI 接口。
+- 内置 ABI 包括 erc20、erc721、erc1155、weth、erc4626、uniswap_v2_router、dex_v2_pair、uniswap_v3_pool、pancake_v3_pool、delegation_manager、erc1271。`--abi erc20` 显式选择 ERC-20 ABI，不访问外部网站、不依赖工作目录中的 ABI 文件。包含常用查询、transfer/approve/transferFrom 和 Transfer/Approval 事件，可用于函数列表、编解码、合约调用、交易解析和事件解码等现有 ABI 接口。
 - 自定义 ABI 仍支持 JSON 数组文件、包含 `abi` 的 artifact 或 JSON 请求中的内联数据；不会被内置 ABI 覆盖。自定义写操作应明确提供 ABI；省略 ABI 只对上述 ERC-20 只读调用生效，其他函数返回 `ABI_REQUIRED`。
 - `examples/contract-abi.json` 仅演示 set/get 自定义合约，不是 ERC-20 ABI，也不代表任何链上部署。真实代币优先使用内置 `erc20`；已有 `examples/erc20.abi.json` 或其他 ABI 文件也可照常使用。
-- DeFi 预设 uniswap_v2_router 覆盖常见九种 V2 swap；dex_v2_pair 提供 token0/token1 与 Swap/Mint/Burn/Sync；uniswap_v3_pool、pancake_v3_pool 提供池子资产查询与常见事件（两者 Swap 布局不同）。这是兼容接口模式，不是官方部署白名单；自动匹配不因此让模板变成已确认可执行。
+- DeFi 预设 uniswap_v2_router 覆盖常见九种 V2 swap；dex_v2_pair 提供 token0/token1 与 Swap/Mint/Burn/Sync；uniswap_v3_pool、pancake_v3_pool、delegation_manager、erc1271 提供池子资产查询与常见事件（两者 Swap 布局不同）。这是兼容接口模式，不是官方部署白名单；自动匹配不因此让模板变成已确认可执行。
 - 内置接口不保证非标准代币都实现这些方法；调用失败需核对 ABI 和实际合约。查询 `balanceOf`、`allowance`、`totalSupply` 返回最小单位原始值，结合 decimals 换算，不把结果直接解释成整枚代币。
 
 JSON 请求示例（地址替换为实际值）：
@@ -234,9 +234,29 @@ python transaction.py plan --chain base --hash "$TX_HASH" --wallet trading --abi
   --override '{"amount":"2000000000000000000"}'
 ```
 
-最后一个例子针对已确认 ERC-20 transfer：amount 是代币最小单位，不是整枚数量。通用覆盖形式是 override.args（完整参数数组或唯一参数名映射）和 override.value_wei；Router 可以显式提供 --abi uniswap_v2_router。自定义签名未知时只能原样模拟，不能猜参数。plan 自动修改已确认标准受益人，展示 parameter_diff；不会修改 owner/证明/签名/deadline，不接受 execute、nonce 或 skip_simulation。它在当前 pending 状态实时模拟、估费、查询 Nonce，不签名、不广播、不写交易意图记录；失败保留模板/diff，ok=false、status=blocked。
+最后一个例子针对已确认 ERC-20 transfer：amount 是代币最小单位，不是整枚数量。通用覆盖形式是 override.args（完整参数数组或唯一参数名映射）和 override.value_wei；Router 可以显式提供 --abi uniswap_v2_router。自定义签名未知时默认原样模拟；可用显式 typed field_map 改完整 word，并强制模拟，不能猜参数。plan 自动修改已确认标准受益人，展示 parameter_diff；不会自动修改 owner/证明/签名，deadline 只按显式覆盖更新，不接受 execute、nonce 或 skip_simulation。它在当前 pending 状态实时模拟、估费、查询 Nonce，不签名、不广播、不写交易意图记录；失败保留模板/diff，ok=false、status=blocked。
 
 fund_flows、摘要裁剪、推断、缓存和历史窗口的字段定义见 [自动分析参考](analysis.md)。summary 的完整 CLI 信封最多 2048 UTF-8 字节，默认仍 full。错误的 suggested_next 和部分成功的 issues/suggested_next 是后续建议，不自动运行或重复业务操作。
+
+## 内层调用、时限与 raw.patch
+
+```bash
+python transaction.py analyze --chain sepolia --hash "$TX_HASH" --view full --include-inputs
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading \
+  --take-call "$CONTRACT:$SELECTOR" --abi uniswap_v2_router \
+  --override '{"recipient":"self","deadline":"now+1800"}'
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading --take-call 'path:0.1.2'
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading --take-call 'execution:0'
+python raw.py patch --chain sepolia --to "$CONTRACT" --address "$OWNER" \
+  --data "$CALLDATA" --word 6 --type address --value "$RECIPIENT" --verify
+python raw.py patch --describe
+```
+
+地址和 selector 必须完整，不接受示例中的缩写。word 6 是 selector 后第七个 32 字节 word，不能在未知函数中直接假定它是 recipient；上例仅说明命令形式。已知 ABI 用重新编码，未知字段只有显式 field_map 才允许 semantic override。完整规则和映射格式见 [分析参考](analysis.md)。
+
+已配置 DelegationManager 的全零模式 single CALL 可独立解包；source=encoded_execution 不冒充真实 call path。其他模式不能按单次 CALL 猜读。外层委托流程 plan 返回 CONTEXT_DEPENDENT_CALL，引导选择实际业务 CALL；它不生成授权或签名。raw.patch 验证和 transaction.plan 都不接受 execute，不广播；带 payload_unverified 的模板由 raw.write 再实时模拟，标记和警告继续保留，不代表安全背书。
+
+timing 展示 ABI/显式映射识别的时间字段与证据，now+1800 使用链上最新区块时间。fund_flows.refunds 单列回流/疑似找零，但金额已经包含在 in/net 内，不能重复统计。
 
 ## JSON 与 Python 接口
 
@@ -245,7 +265,7 @@ python token.py --input-json examples/convert-request.json
 echo '{"operation":"convert","params":{"amount":"1.25","decimals":6}}' | python token.py --input-json -
 ```
 
-输入固定为 `{"operation":"...","params":{...}}`，JSON 输入不能混入业务 CLI 参数。ABI、模板、typed_data 在 JSON 请求里可直接使用对象或数组，在 CLI 中使用文件路径；ABI 另支持内置名称 erc20、erc721、erc1155、weth、erc4626、uniswap_v2_router、dex_v2_pair、uniswap_v3_pool、pancake_v3_pool，标准 ERC-20 的 contract call 可省略 ABI。
+输入固定为 `{"operation":"...","params":{...}}`，JSON 输入不能混入业务 CLI 参数。ABI、模板、typed_data 在 JSON 请求里可直接使用对象或数组，在 CLI 中使用文件路径；ABI 另支持内置名称 erc20、erc721、erc1155、weth、erc4626、uniswap_v2_router、dex_v2_pair、uniswap_v3_pool、pancake_v3_pool、delegation_manager、erc1271，标准 ERC-20 的 contract call 可省略 ABI。
 
 输出固定为：
 

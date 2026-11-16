@@ -74,6 +74,7 @@ confirmations = 2
 fee_mode = "auto"
 
 [chains.sepolia]
+delegation_managers = ["0xdb9b1e94b5b69df7e401ddbede43491141047db3"]
 chain_id = 11155111
 symbol = "ETH"
 decimals = 18

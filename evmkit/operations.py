@@ -28,8 +28,8 @@ OPS = {
                     "nonce": BASE | {"address"}, "gas": {"chain"},
                     "wait": {"chain", "hash", "confirmations", "timeout"},
                     "decode": {"chain", "hash", "abi", "signature"} | ANALYSIS,
-                    "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses", "require_trace", "focus_address", "view"} | ANALYSIS,
-                    "plan": {"chain","hash","wallet","abi","signature","override","gas","gas_price_wei","max_fee_per_gas_wei","max_priority_fee_per_gas_wei"} | ANALYSIS,
+                    "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses", "require_trace", "focus_address", "view", "include_inputs"} | ANALYSIS,
+                    "plan": {"chain","hash","wallet","abi","signature","override","field_map","take_call","gas","gas_price_wei","max_fee_per_gas_wei","max_priority_fee_per_gas_wei"} | ANALYSIS,
                     "export-template": {"chain", "hash", "abi", "signature", "output"} | ANALYSIS,
                     "accelerate": BASE | WRITE | {"hash"}, "cancel": BASE | WRITE | {"hash"},
                     "replay": BASE | {"hash", "execute", "wait", "confirmations", "timeout"}},
@@ -51,6 +51,7 @@ OPS = {
             "mint": BASE | WRITE | {"contract", "abi", "function", "signature", "args", "value_wei"}},
     "events": {"read": {"chain", "contract", "from_block", "to_block", "topics", "abi", "chunk_size", "include_unconfirmed"} | ANALYSIS},
     "raw": {"encode": {"signature", "args"}, "decode": {"data", "signature", "abi", "output_types"},
+            "patch":{"chain","wallet","address","to","data","word","type","value","value_wei","verify"},
             "call": BASE | {"to", "data", "signature", "args", "value_wei", "address", "block", "output_types", "template"},
             "write": BASE | WRITE | {"to", "data", "signature", "args", "value_wei", "template"},
             "template": {"template"}, "reencode": {"template", "args", "output"}},
@@ -113,6 +114,15 @@ class Toolkit:
     def run(self, module, operation, params):
         response=self._run(module,operation,params)
         from .agent_output import suggested_next,summary_envelope
+        if module=="transaction" and operation=="analyze" and response.get("ok"):
+            from .calldata import refresh_timing,input_fields
+            refresh_timing(response["data"])
+            include=params.get("include_inputs",False)
+            for group in (response["data"].get("internal_calls",{}),response["data"].get("declared_calls",{})):
+                for row in group.get("calls",[]):
+                    row.update(input_fields(row))
+                    if include: row["input_raw"]=row.get("input")
+                    else: row.pop("input",None);row.pop("input_raw",None)
         if response.get("error"):
             response["error"]["suggested_next"]=suggested_next(params,response.get("data"),response["error"]["code"])
         if module=="transaction" and operation=="analyze" and isinstance(params,dict) and params.get("view")=="summary":
@@ -127,7 +137,7 @@ class Toolkit:
             require(module in OPS and operation in OPS[module], "Unknown operation")
             require(isinstance(params, dict), "params must be an object")
             require(not (set(params) - OPS[module][operation]), "Unknown operation parameters")
-            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache"):
+            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache", "include_inputs", "verify"):
                 if key in params: require(isinstance(params[key], bool), f"{key} must be boolean")
             if params.get("chain"):
                 chain_id = self.config.chain(params["chain"])["chain_id"]
@@ -291,6 +301,7 @@ class Toolkit:
         from .analysis import Analyzer
         from .cache import SnapshotCache,analysis_key
         require(p.get("view","full") in ("summary","full"),"view must be summary or full")
+        require(not(p.get("view")=="summary" and p.get("include_inputs")),"--include-inputs requires --view full; summary cannot carry unbounded calldata")
         self.config.chain(p.get("chain"));txhash(p["hash"])
         if p.get("focus_address"): address(p["focus_address"],field="focus_address")
         cache=SnapshotCache(self.config);key=analysis_key(self.config,p)
@@ -519,6 +530,25 @@ class Toolkit:
 
     def raw_encode(self, p): return {"data": encode_call(p["signature"], p.get("args", []))}
 
+    def raw_patch(self,p):
+        from .calldata import patch_word
+        require(p.get("verify") is True,"raw.patch requires --verify (or verify=true); patching without simulation is not supported")
+        chain,rpc=self.rpc(p);sender=self.owner(p);target=address(p["to"])
+        patched,diff=patch_word(p["data"],p["word"],p["value"],p.get("type","bytes32"))
+        value=uint(p.get("value_wei","0"),"value_wei")
+        notes=["payload_unverified: whole-word edits do not prove ABI structure or business semantics", "A successful eth_call is not a guarantee of intended effects or future execution"]
+        template={"schema_version":1,"source":{"chain_id":chain["chain_id"],"sender":sender,"kind":"raw_patch"},"to":target,"value_wei":str(value),
+                  "data":patched,"decoded":{"status":"unknown","selector":patched[:10]},"payload_unverified":True,"warnings":notes}
+        out={"status":"verified_preview","data":patched,"payload_unverified":True,"parameter_diff":[diff],"template":template,
+             "verification":{"status":"pending","from":sender,"to":target,"value_wei":str(value),"block":"pending"},"warnings":notes}
+        try:
+            returned=rpc.read(lambda w:w.eth.call({"from":sender,"to":target,"value":value,"data":patched},"pending"))
+            out["verification"].update(status="success",return_data=jsonable(returned))
+        except ToolError as exc:
+            out["status"]="blocked";out["verification"].update(status="failed",reason=exc.code,details=exc.data)
+            raise ToolError(exc.code,exc.message,retryable=exc.retryable,data=out) from None
+        return out
+
     def raw_decode(self, p):
         if p.get("output_types") is not None:
             try: return {"values": decode(p["output_types"], bytes.fromhex(hexdata(p["data"])[2:]))}
@@ -543,6 +573,8 @@ class Toolkit:
             require(uint(template["source"]["chain_id"]) == chain["chain_id"], "Template belongs to another chain")
             require(p.get("data") is None and p.get("signature") is None and p.get("args") is None, "Reencode template before changing its calldata")
             if template.get("warnings"): self.warnings.extend(template["warnings"])
+            if template.get("payload_unverified"):
+                self.warnings.append("payload_unverified: calldata structure and intended effects remain unconfirmed; simulate before execution")
             return address(p.get("to", template["to"])), uint(p.get("value_wei", template["value_wei"])), template["data"]
         require((p.get("data") is None) != (p.get("signature") is None), "Provide exactly one of data or signature")
         require(p.get("data") is None or p.get("args") is None, "args requires signature")
@@ -563,7 +595,10 @@ class Toolkit:
 
     def raw_write(self, p):
         to, value, data = self.raw_input(p)
-        return self.send(p, to, value, data)
+        result_=self.send(p, to, value, data)
+        if p.get("template") is not None and validate_template(p["template"]).get("payload_unverified"):
+            result_["payload_unverified"]=True
+        return result_
 
     def signing_message(self, p): return self.sign(p, encode_defunct(text=p["message"]), p["message"])
 
@@ -720,4 +755,5 @@ def validate_template(value):
     else:
         require(decoded.get("status") == "unknown", "Invalid decoding status")
     require(isinstance(template.get("warnings", []), list) and all(isinstance(i, str) for i in template.get("warnings", [])), "Invalid template warnings")
+    if "payload_unverified" in template:require(isinstance(template["payload_unverified"],bool),"payload_unverified must be boolean")
     return json.loads(json.dumps(template))

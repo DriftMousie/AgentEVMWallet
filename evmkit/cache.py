@@ -42,7 +42,7 @@ class SnapshotCache:
 
 
 def analysis_key(config, params):
-    clean = {k:v for k,v in params.items() if k not in ("view","no_cache")}
+    clean = {k:v for k,v in params.items() if k not in ("view","no_cache","include_inputs")}
     fingerprints = []
     paths = [config.path]
     for value in (config.raw.get("rpc",{}).get("csv_file","rpc.csv"),
@@ -58,4 +58,4 @@ def analysis_key(config, params):
     if not secret.is_absolute(): secret = config.path.parent/secret
     try: stat=secret.stat(); fingerprints.append((stat.st_mtime_ns,stat.st_size,stat.st_mode & 0o777))
     except OSError: fingerprints.append(None)
-    return hashlib.sha256(json.dumps(["analysis-v2",clean,config.raw,fingerprints],sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(["analysis-v3",clean,config.raw,fingerprints],sort_keys=True).encode()).hexdigest()

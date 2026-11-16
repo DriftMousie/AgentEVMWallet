@@ -101,8 +101,14 @@ def jsonable(value: Any):
     if isinstance(value, dict) or hasattr(value, "items"):
         structural = {"schema_version", "chain_id", "decimals", "confirmations", "data_bytes", "completed_through", "latency_ms", "failed_step",
                       "returned","limit","pages","count","success","failed","unknown","non_call_transactions","token_count","nft_count","risk_count","unknowns_count",
-                      "requests_used","current_requests_used","rpc_calls","ttl_seconds","planned_pairs","attempted_pairs","completed_pairs","summary_max_utf8_bytes"}
-        return {str(k): v if k in structural and isinstance(v, int) and not isinstance(v, bool) else jsonable(v) for k, v in value.items()}
+                      "requests_used","current_requests_used","rpc_calls","ttl_seconds","planned_pairs","attempted_pairs","completed_pairs","summary_max_utf8_bytes",
+                      "input_bytes","word_index","byte_offset","execution_index","reference_timestamp","refund_count","receipt_position","log_index"}
+        out={}
+        for k,v in value.items():
+            if k in ("path","call_path","field_path") and isinstance(v,list) and all(isinstance(i,int) and not isinstance(i,bool) or isinstance(i,str) and i.isdigit() for i in v):
+                out[str(k)]=[int(i) for i in v]
+            else:out[str(k)]=v if k in structural and isinstance(v,int) and not isinstance(v,bool) else jsonable(v)
+        return out
     if isinstance(value, (list, tuple)):
         return [jsonable(v) for v in value]
     return value

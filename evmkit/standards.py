@@ -106,9 +106,12 @@ V3_COMMON = POOL_TOKENS + [
 ]
 UNISWAP_V3_POOL = V3_COMMON + [E("Swap", V3_SWAP)]
 PANCAKE_V3_POOL = V3_COMMON + [E("Swap", V3_SWAP + [("protocolFeesToken0", "uint128", False), ("protocolFeesToken1", "uint128", False)])]
+DELEGATION_MANAGER=[F("redeemDelegations",[("permissionContexts","bytes[]"),("modes","bytes32[]"),("executionCallDatas","bytes[]")],state="nonpayable")]
+ERC1271=[F("isValidSignature",[("hash","bytes32"),("signature","bytes")],[("magicValue","bytes4")])]
 PRESETS = {"erc20": ERC20, "erc721": ERC721, "erc1155": ERC1155, "weth": WETH, "erc4626": ERC4626,
            "uniswap_v2_router": V2_ROUTER, "dex_v2_pair": V2_PAIR,
-           "uniswap_v3_pool": UNISWAP_V3_POOL, "pancake_v3_pool": PANCAKE_V3_POOL}
+           "uniswap_v3_pool": UNISWAP_V3_POOL, "pancake_v3_pool": PANCAKE_V3_POOL,
+           "delegation_manager":DELEGATION_MANAGER,"erc1271":ERC1271}
 
 
 def preset(name):

@@ -249,6 +249,7 @@ class Analyzer:
                 key = (signature, tuple(names))
                 if key not in values:
                     values[key] = {**decoded, "named_args": dict(zip(names, decoded["args"])), "standards": [],
+                                   "parameter_schema":item["inputs"],
                                    "source": record.get("source", "builtin"), "historical_match": False, "sources": [], "abi_addresses": []}
                 values[key]["standards"] = sorted(set(values[key]["standards"]+record.get("standards", [])))
                 values[key]["historical_match"] |= record.get("historical_match", False)
@@ -267,6 +268,7 @@ class Analyzer:
             names = [i.get("name") or f"arg{j}" for j, i in enumerate(record["inputs"])] if record else [f"arg{j}" for j in range(len(out["args"]))]
             if len(names) != len(set(names)): names = [f"arg{j}" for j in range(len(out["args"]))]
             out.update(named_args=dict(zip(names, out["args"])), source="explicit", confidence="user_supplied", template_safe=True)
+            if record:out["parameter_schema"]=record["inputs"]
             return out
         if data == "0x":
             return {"status": "empty", "input_kind": "empty", "selector": None, "source": "none", "candidates": []}
@@ -535,10 +537,12 @@ class Analyzer:
                 execution_context = context if calltype in ("DELEGATECALL", "CALLCODE") else target
                 item = {"path": path, "type": calltype, "from": address(frame["from"]) if frame.get("from") else None, "to": target,
                         "execution_context": execution_context, "value_wei": str(int(frame.get("value") or "0x0", 16)),
-                        "input": frame.get("input", "0x"), "output": frame.get("output", "0x"),
+                        "input": ashex(frame["input"]) if frame.get("input") is not None else None, "output": frame.get("output", "0x"),
                         "error": str(frame["error"])[:256] if frame.get("error") else None,
                         "committed": not failed, "may_carry_value": calltype in ("CALL", "CREATE", "CREATE2", "SELFDESTRUCT")}
                 item["is_value_transfer"] = item["may_carry_value"] and not failed and int(item["value_wei"]) > 0
+                from .calldata import input_fields
+                item.update(input_fields(item))
                 decoded = self.attempt(lambda: self.decode_input(item["input"], target, context=execution_context), "INTERNAL_DECODE")
                 item["decoded"] = decoded
                 rows.append(item)
@@ -562,6 +566,8 @@ class Analyzer:
             row["committed"] = False if row["error"] else None
             value = int(row["value_wei"], 16 if row["value_wei"].startswith("0x") else 10)
             row["is_value_transfer"] = False if not row["may_carry_value"] or value == 0 or row["error"] else None
+            from .calldata import input_fields
+            row.update(input_fields(row))
             if row["input"]:
                 row["decoded"] = self.attempt(lambda: self.decode_input(row["input"], row["to"]), "INTERNAL_DECODE")
             rows.append(row)
@@ -748,6 +754,10 @@ class Analyzer:
         else:
             decoded = self.attempt(lambda: self.decode_input(tx["data"], tx.get("to")), "INPUT_DECODE", required=True) or {"status": "unknown", "candidates": []}
         self.memo["root_decode"]=decoded
+        from .delegation import declared_calls,classify_delegation
+        declared=self.attempt(lambda:declared_calls(tx,self.chain,self.options["max_frames"]),"DECLARED_EXECUTION") or {"status":"unavailable","calls":[],"source":"encoded_execution","manager":None}
+        for row in declared["calls"]:
+            row["decoded"]=self.attempt(lambda:self.decode_input(row["input"],row["to"]),"DECLARED_DECODE")
         self.budget.phase = "amounts"
         amounts = self.attempt(lambda: self.input_amounts(decoded, tx.get("to"), tx.get("value",0)), "INPUT_AMOUNTS") or []
         if int(tx.get("value", 0)) > 0 and not any(a["argument"] == "transaction.value" for a in amounts):
@@ -777,6 +787,11 @@ class Analyzer:
             hint=self.attempt(lambda:self.approval_hint(decoded),"APPROVAL_HINT")
             if hint:
                 classification["inferred_intent"]=hint[0];risks.append(hint[1])
+        delegated=self.attempt(lambda:classify_delegation(self,tx,internals,sender,declared,counterpart),"DELEGATION_CONTEXT")
+        if delegated:
+            delegated["business_classification"]=classification
+            classification=delegated
+            risks.append({"code":"CONTEXT_DEPENDENT_REPLAY","severity":"warning","message":delegated["note"]})
         if counterpart:
             executed = list(dict.fromkeys(row["to"] for row in internals["calls"]
                             if row.get("type") == "DELEGATECALL" and row.get("execution_context") == tx.get("to") and len(row.get("path") or []) == 1))
@@ -830,6 +845,7 @@ class Analyzer:
         output = {"inspection": self.inspection, "input_decode": decoded, "amounts": amounts,
                 "decoded_events": events, "sender": sender, "counterpart": counterpart, "balance_changes": changes,
                 "internal_calls": internals, "classification": classification, "risks": risks,
+                "declared_calls":declared,
                 "analysis_status": "complete" if complete else "partial", "warnings": warnings,
                 "analysis_profile": "strict_trace" if self.options["require_trace"] else "standard",
                 "core_status": {"input": "complete" if input_complete else "partial", "events": "complete" if events_complete else "partial"},
@@ -843,4 +859,5 @@ class Analyzer:
         next_params={**self.params,"chain":self.chain["alias"],"hash":ashex(tx["hash"])}
         output["suggested_next"]=suggested_next(next_params,output) if warnings else []
         output["issues"]=[{"code":code,"suggested_next":output["suggested_next"]} for code in warnings]
-        return output
+        from .calldata import refresh_timing
+        return refresh_timing(output)

@@ -9,9 +9,9 @@ from .common import ToolError, jsonable, result, require, wallet_selectors
 from .config import Config
 from .operations import OPS, Toolkit
 
-JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types", "override"}
-BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache"}
-NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses", "limit"}
+JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types", "override", "field_map"}
+BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache", "include_inputs", "verify"}
+NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses", "limit", "word"}
 
 
 class ParseError(Exception): pass
@@ -50,14 +50,17 @@ def main(module, argv=None):
                 sub.add_argument("--wallets", "--wallet", dest="wallets", action=WalletsAction,
                                  default=argparse.SUPPRESS, help='Wallet IDs/labels: trading,treasury or JSON ["trading","treasury"]')
                 continue
-            if field == "no_cache":
+            if field=="verify":
+                kwargs["action"]="store_true";kwargs["help"]="Required: eth_call the patched payload from the selected sender; never broadcasts"
+            elif field == "no_cache":
                 kwargs["action"]="store_true"
                 kwargs["help"]="Refresh persistent caches; within-request deduplication remains enabled"
             elif field in BOOL_FIELDS:
                 kwargs["action"] = argparse.BooleanOptionalAction
             elif field in JSON_FIELDS:
                 kwargs["type"] = json.loads
-                kwargs["help"] = "JSON object" if field=="override" else "JSON array"
+                kwargs["help"] = "JSON object" if field in ("override","field_map") else "JSON array"
+            elif field=="type" and module=="raw" and name=="patch":kwargs["choices"]=["address","uint256","bytes32"]
             elif field == "view":
                 kwargs["choices"]=["summary","full"]
             elif field == "direction":
@@ -65,7 +68,8 @@ def main(module, argv=None):
             elif field in NUM_FIELDS:
                 kwargs["type"] = int
             elif field == "abi":
-                kwargs["help"] = "ABI JSON file or preset: erc20, erc721, erc1155, weth, erc4626, uniswap_v2_router, dex_v2_pair, uniswap_v3_pool, pancake_v3_pool; transaction decode also auto-detects"
+                from .standards import PRESETS
+                kwargs["help"] = "ABI JSON file or preset: "+", ".join(PRESETS)+"; transaction decode also auto-detects"
             elif field in {"gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei"}:
                 kwargs["help"] = "Integer wei per gas, NOT gwei (1 gwei = 1000000000 wei)"
             if field == "require_trace": kwargs["help"] = "Require both callTracer and prestateTracer diff; optional source failures otherwise do not lower core status"
@@ -96,7 +100,7 @@ def main(module, argv=None):
             require(operation is None or operation == request["operation"], "Operation differs from JSON input")
             operation, opts = request["operation"], request["params"]
         require(operation is not None, "Provide a subcommand or --input-json")
-        analysis_only = module in ("events","address") or module == "chain" and operation == "probe" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
+        analysis_only = module in ("events","address") or module == "raw" and operation=="patch" and not opts.get("wallet") or module == "chain" and operation == "probe" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
         config = Config(path=config_options.get("config"), env_file=config_options.get("env_file"), state_dir=config_options.get("state_dir"), load_wallets=not analysis_only)
         response = Toolkit(config).run(module, operation, opts)
     except (ParseError, ToolError) as exc:

@@ -6,4 +6,4 @@ else:
         """Return the same JSON-compatible envelope as CLI."""
         from evmkit.config import Config
         from evmkit.operations import Toolkit
-        return Toolkit(config or Config()).run("raw", operation, params)
+        return Toolkit(config or Config(load_wallets=not(operation=="patch" and not params.get("wallet")))).run("raw", operation, params)
