@@ -1,0 +1,5 @@
+# Direct runtime dependencies, tested on Python 3.12.
+web3==7.14.0
+eth-account==0.13.7
+eth-abi==6.0.0b1
+python-dotenv==1.2.2

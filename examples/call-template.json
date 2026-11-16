@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "source": {
+    "chain_id": 8453,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "sender": "0x0000000000000000000000000000000000000001",
+    "status": "example"
+  },
+  "to": "0x0000000000000000000000000000000000000001",
+  "value_wei": "0",
+  "data": "0x60fe47b1000000000000000000000000000000000000000000000000000000000000002a",
+  "decoded": {
+    "status": "decoded",
+    "signature": "set(uint256)",
+    "types": [
+      "uint256"
+    ],
+    "args": [
+      "42"
+    ]
+  },
+  "warnings": [
+    "Example only: replace source and target with real chain data"
+  ]
+}

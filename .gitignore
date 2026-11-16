@@ -1,0 +1,28 @@
+.env
+.env.*
+!.env.example
+.state/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.devdeps/
+*.sqlite3*
+# Local RPC CSV may contain provider API keys.
+config/rpc*.csv
+# Local metadata, credentials, scratch files and test reports.
+.DS_Store
+._*
+*.log
+*.pem
+*.key
+*.bak
+*.swp
+*.swo
+.coverage*
+htmlcov/
+test-results/
+Agent_Test_Report*.md
+Agent_Test_Report*.MD
+config/*.local.toml
+config/*.local.csv

@@ -1,0 +1,206 @@
+# 工具包技术参考（供 Agent 按需读取）
+
+本文中的命令和文件路径均相对用户提供的工具包根目录，不是本参考文档或 Skill 的安装目录。先定位工具包，再执行命令。
+
+面向 Hermes Agent 的本地 EOA 钱包工具包。12 个 Python 文件可独立运行，公共实现位于 `evmkit/`。默认只预览，显式 `--execute` 才签名或广播。
+
+## 环境与初始化
+
+先检查目标机器上的解释器和依赖，优先使用用户指定或当前可用的 Python 3.12 及以上兼容环境，不要求 Conda，也不要求激活任何特定名称的环境。下面的 `python` 表示已选定的解释器；如果系统只有 `python3` 或需要使用虚拟环境解释器的绝对路径，替换命令中的 `python`，并始终用同一解释器运行脚本和 `-m pip`。
+
+```bash
+# 使用目标机器上选定的 Python，无需激活特定 Conda 环境
+python --version
+# 已有环境可先检查下方离线示例；新环境安装运行依赖：
+python -m pip install -r requirements.lock.txt
+test -e .env || cp .env.example .env
+chmod 600 .env
+test -e config/rpc.csv || cp config/rpc.csv.example config/rpc.csv
+python chain.py list
+python wallet.py list
+python token.py convert --amount '1.25' --decimals 6
+```
+
+`.env` 只保存钱包私钥；在 `config/rpc.csv` 填入 RPC URL；`config/settings.toml` 配置钱包标签、观察地址和链。示例观察地址只是占位地址。
+
+### RPC CSV
+
+```csv
+chain,name,url,priority,enabled
+base,primary,https://your-primary-provider.example/rpc,10,true
+base,backup,https://your-backup-provider.example/rpc,20,true
+ethereum,primary,https://your-ethereum-provider.example/rpc,10,true
+```
+
+以上 URL 是占位示例。`chain` 对应 TOML 的链别名；同一条链可添加任意多行，`name` 在链内唯一。`priority` 为非负整数，越小越优先，相同时按 CSV 行顺序；`enabled` 接受 `true/false` 或 `1/0`。禁用行允许空 URL，启用行必须有有效 HTTP(S) URL。模板行默认禁用，填写 URL 后改为 `true`。
+
+TOML 的 `[rpc] csv_file = "rpc.csv"` 指定 CSV 路径，相对路径以 TOML 所在目录为基准。RPC 不再读取 `.env` 或进程环境变量。每个端点仍验证 Chain ID，并在读取故障时切换备用端点。
+
+本地 `config/rpc.csv` 已加入忽略规则，避免提交 URL 内的供应商密钥；仓库分发 `config/rpc.csv.example`。已有本地 CSV 不会被程序覆盖。健康检查通过 `rpc_name` 标识端点，不返回完整 URL。
+
+当前锁文件根据本机 Python 3.12/macOS 测试环境生成，包含 `eth-abi==6.0.0b1`，不绑定环境名称。这是已有环境的预发布版本；升级、换成稳定版本或迁移到其他平台后需重新运行测试。`requirements.txt` 固定直接依赖，`requirements.lock.txt` 固定运行时依赖闭包。
+
+钱包选择支持 `id` 或唯一 `label`。观察钱包可以查询和预览，不能签名。所有写操作都必须明确指定钱包和链。
+
+环境变量优先于 `.env`；默认只读取项目根目录 `.env`。可通过 `--config`、`--env-file`、`--state-dir` 使用其他配置。相对路径按当前工作目录解析。
+
+## 模块与调用
+
+| 文件 | 子命令 |
+|---|---|
+| `chain.py` | `list`、`health`、`block`、`fees` |
+| `wallet.py` | `list`、`validate`、`balance`、`balances` |
+| `token.py` | `info`、`convert` |
+| `transaction.py` | `inspect`、`status`、`nonce`、`gas`、`wait`、`decode`、`export-template`、`accelerate`、`cancel`、`replay` |
+| `contract.py` | `functions`、`encode`、`decode`、`call`、`write` |
+| `transfer.py` | `native`、`erc20` |
+| `approve.py` | `allowance`、`set`、`revoke` |
+| `nft.py` | `info`、`balance-batch`、`transfer`、`transfer-batch`、`approve`、`revoke`、`mint` |
+| `events.py` | `read` |
+| `raw.py` | `encode`、`decode`、`call`、`write`、`template`、`reencode` |
+| `signing.py` | `message`、`typed`、`verify-message`、`verify-typed` |
+| `batch.py` | `run` |
+
+每个子命令的参数可用 `python <文件> <子命令> --help` 查看。CLI 参数使用连字符，JSON 参数使用下划线。数组参数是 JSON，例如 `--args '["42"]'`；布尔参数使用 `--execute`、`--no-approved` 等。
+
+```bash
+# 检查 RPC，查询余额
+python chain.py health --chain base
+python wallet.py balance --chain base --wallet treasury
+python wallet.py balances --chain base --wallets '["treasury","trading"]' --tokens '[]'
+python token.py info --chain base --token 0x0000000000000000000000000000000000000001
+
+# 先预览，再显式执行；--wait 等待链配置的确认数
+python transfer.py native --chain base --wallet treasury \
+  --to 0x0000000000000000000000000000000000000002 --amount '0.001'
+python transfer.py native --chain base --wallet treasury \
+  --to 0x0000000000000000000000000000000000000002 --amount '0.001' --execute --wait
+
+# 原生币或 ERC-20 可以使用 --amount-raw 最小单位整数，不能同时给 --amount
+python transfer.py erc20 --chain base --wallet trading \
+  --token 0x0000000000000000000000000000000000000001 \
+  --to 0x0000000000000000000000000000000000000002 --amount-raw '1000000'
+
+# 指定额度授权；无限授权显式使用 --unlimited
+python approve.py set --chain base --wallet trading \
+  --token 0x0000000000000000000000000000000000000001 \
+  --spender 0x0000000000000000000000000000000000000002 --amount-raw '1000'
+
+# ABI 可以是数组文件，也可以是包含 abi 字段的 artifact
+python contract.py functions --abi examples/contract-abi.json
+python contract.py encode --abi examples/contract-abi.json --function 'set(uint256)' --args '["42"]'
+python contract.py call --chain base --contract 0x0000000000000000000000000000000000000001 \
+  --abi examples/contract-abi.json --function 'get()'
+
+# NFT standard 使用 721 或 1155；Mint 必须提供具体函数
+python nft.py mint --chain base --wallet trading \
+  --contract 0x0000000000000000000000000000000000000001 \
+  --signature 'mint(address,uint256)' --args '["0x0000000000000000000000000000000000000002","1"]'
+
+# 事件默认读已达到配置确认数的区块，不自动访问 metadata URI
+python events.py read --chain base --contract 0x0000000000000000000000000000000000000001 \
+  --from-block 100 --to-block 200 --chunk-size 100
+
+# 消息和结构化数据签名也默认只预览
+python signing.py message --wallet trading --message 'hello'
+python signing.py typed --chain base --wallet trading --typed-data examples/typed-data.json
+```
+
+上例地址均为占位地址，合约操作需要换成实际合约地址。
+
+## 交易哈希 → 调用模板 → Raw 交互
+
+```bash
+# TX_HASH 是用户提供的完整 32 字节交易哈希；必须同时指定链
+python transaction.py inspect --chain base --hash "$TX_HASH"
+python transaction.py decode --chain base --hash "$TX_HASH" --abi examples/contract-abi.json
+python transaction.py export-template --chain base --hash "$TX_HASH" \
+  --signature 'set(uint256)' --output template.json
+
+# 无 ABI/签名时仍可导出完整 calldata，decoded.status 为 unknown
+# 输出文件不会覆盖已有文件
+python raw.py template --template template.json
+python raw.py reencode --template template.json --args '["43"]' --output template-43.json
+python raw.py write --chain base --wallet trading --template template-43.json
+# 确认要发送后，重复命令并加 --execute；可加 --wait
+```
+
+模板文件直接保存模板对象，标准输出则返回统一结果信封。模板只带来源、目标、金额、calldata 和可选解码信息，不带原 Nonce、费用或签名。
+
+`raw write --template` 可以显式覆盖 `--to`、`--value-wei`，不能同时覆盖 `--data` 或 `--signature`。修改已解码参数必须通过 `reencode` 重新编码；参数和 calldata 不一致会拒绝执行。模板链必须与执行链一致。
+
+没有 ABI 或函数签名时不会猜测参数含义。顶层交易输入不等于内部调用，首版不使用 trace。原交易成功也不保证换钱包或换时间后成功，尤其要检查接收地址、截止时间、签名和白名单证明。
+
+```bash
+python raw.py encode --signature 'transfer(address,uint256)' \
+  --args '["0x0000000000000000000000000000000000000002","100"]'
+python raw.py call --chain base --to 0x0000000000000000000000000000000000000001 \
+  --signature 'balanceOf(address)' --args '["0x0000000000000000000000000000000000000002"]' \
+  --output-types '["uint256"]'
+```
+
+`--data` 接受偶数长度的 `0x` 十六进制数据；函数签名必须完整，使用 `uint256` 等规范类型。动态参数、tuple 和数组均按 ABI 编码，不做十六进制字符串替换。
+
+## JSON 与 Python 接口
+
+```bash
+python token.py --input-json examples/convert-request.json
+echo '{"operation":"convert","params":{"amount":"1.25","decimals":6}}' | python token.py --input-json -
+```
+
+输入固定为 `{"operation":"...","params":{...}}`，JSON 输入不能混入业务 CLI 参数。ABI、模板、typed_data 在 JSON 请求里可直接使用对象或数组，在 CLI 中使用文件路径。
+
+输出固定为：
+
+```json
+{"schema_version":1,"ok":true,"operation":"token.convert","chain_id":null,"wallet":null,"data":{"amount_raw":"1250000","amount":"1.25","decimals":6},"warnings":[],"error":null}
+```
+
+失败时 `ok=false`，`error` 包含 `code`、`message`、`retryable`，退出码为 1；成功为 0。大整数、链上金额与 Token ID 为字符串，协议版本、链 ID、精度、确认数等结构字段为整数。RPC 原始字段中的整数按字符串输出。
+
+```python
+from evmkit.config import Config
+from evmkit.operations import Toolkit
+
+toolkit = Toolkit(Config())
+response = toolkit.run("token", "convert", {"amount": "1.25", "decimals": 6})
+assert response["ok"]
+
+# 每个入口也可导入（token.py 的名称与标准库冲突，Python 调用优先使用 Toolkit）
+import transfer
+response = transfer.run({"chain": "base", "wallet": "trading", "to": "0x0000000000000000000000000000000000000002", "amount": "0.001"}, "native")
+```
+
+## 交易执行与故障处理
+
+- 每个 RPC 使用前验证 Chain ID。读请求有限重试并可切换端点；发送只尝试一次。
+- 预览不预留 Nonce，执行时重新读取和模拟。Gas 默认估算值乘 1.2 并向上取整。
+- 支持 `--gas-price-wei`，或 `--max-fee-per-gas-wei` 和 `--max-priority-fee-per-gas-wei`；两类费用互斥。
+- 模拟失败默认停止。显式绕过必须同时提供 `--skip-simulation --gas 300000 --reason '具体原因'`。仍检查地址、Chain ID 和余额。
+- 费用仅估算 EVM 执行费，不包含链专用 L1/数据附加费用。
+- 按链和钱包使用 POSIX 文件锁，协调本工具包跨进程发送；不协调外部钱包。
+- `.state/transactions.sqlite3` 只存 unsigned 交易参数、哈希和状态。不要删除记录来解决未知广播；先查询原哈希。
+- Nonce 同时参考 RPC pending 与本地已签名交易记录。RPC 传播延迟不会自动复用本地已使用 Nonce；交易丢弃可能留下空档，需要查询并显式处理原交易。
+- `BROADCAST_UNKNOWN` 时先用 `transaction inspect` 查询返回的哈希；需要重播时用同链同钱包的 `transaction replay --hash ... --execute`。它只重播哈希一致的原签名交易。
+- `CONFIRMATION_TIMEOUT` 代表未达到确认数，不代表链上失败。`TRANSACTION_FAILED` 代表回执明确失败。
+- `accelerate`、`cancel` 只处理选定钱包的 pending 交易，默认至少提高原费用约 13%；节点规则可能要求更高费用，可显式覆盖。替换成功不保证原交易未先上链。
+- `approve set --zero-first` 第一步等待确认后再执行第二步；预览时第二步标记为依赖前一步，不假装已在清零后的状态模拟。
+
+这是同系统用户可读取 `.env` 的本地密钥方案，未引入独立签名服务或进程隔离。公开 calldata、模板、消息和签名仍可能包含业务敏感内容，工具不会将它们全部隐藏。
+
+## 简单批量与 Hermes
+
+```bash
+python batch.py run --file examples/batch.json
+python batch.py run --file examples/batch.json --execute
+```
+
+批次按顺序执行；默认预览，执行时写交易逐笔等待确认。默认失败停止，可用 `--continue-on-error` 继续独立项。广播状态未知或确认超时后，即使选择继续，也停止该钱包同链后续写入。不自动重跑整个批次、不提供调度和断点恢复。
+
+将 `skills/evm-wallet` 复制到 Hermes 的 skill 目录，或配置 Hermes 扫描项目内 skill 目录；在使用时告知工具包绝对路径。Skill 不自动写入全局配置。详见 [Skill](../SKILL.md)。
+
+## 发布范围
+
+发布目录仅包含运行代码、配置模板、用法示例和 Agent 文档，不附带开发测试代码、夹具或测试指南。
+
+首版不含 MCP、智能账户、部署、内部 trace、资产/授权全量索引、桥、市场、调度和任务恢复。完整设计记录见 [plan.MD](../../../plan.MD)。

@@ -1,0 +1,5 @@
+[
+  {"id":"wallets","module":"wallet","operation":"list","params":{}},
+  {"id":"convert","module":"token","operation":"convert","params":{"amount":"1.25","decimals":6}},
+  {"id":"encode","module":"raw","operation":"encode","params":{"signature":"set(uint256)","args":["42"]}}
+]

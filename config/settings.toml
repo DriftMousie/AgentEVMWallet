@@ -1,0 +1,64 @@
+[rpc]
+# Relative to this TOML file; URLs live exclusively in CSV.
+csv_file = "rpc.csv"
+
+[wallets.treasury]
+label = "资金钱包"
+key_env = "TREASURY_PRIVATE_KEY"
+
+[wallets.trading]
+label = "交互钱包"
+key_env = "TRADING_PRIVATE_KEY"
+
+[wallets.watch]
+label = "观察地址"
+address = "0x0000000000000000000000000000000000000001"
+
+[chains.ethereum]
+chain_id = 1
+symbol = "ETH"
+decimals = 18
+confirmations = 2
+fee_mode = "auto"
+
+[chains.base]
+chain_id = 8453
+symbol = "ETH"
+decimals = 18
+confirmations = 2
+fee_mode = "auto"
+
+[chains.arbitrum]
+chain_id = 42161
+symbol = "ETH"
+decimals = 18
+confirmations = 2
+fee_mode = "auto"
+
+[chains.optimism]
+chain_id = 10
+symbol = "ETH"
+decimals = 18
+confirmations = 2
+fee_mode = "auto"
+
+[chains.polygon]
+chain_id = 137
+symbol = "POL"
+decimals = 18
+confirmations = 2
+fee_mode = "auto"
+
+[chains.bsc]
+chain_id = 56
+symbol = "BNB"
+decimals = 18
+confirmations = 2
+fee_mode = "auto"
+
+[chains.sepolia]
+chain_id = 11155111
+symbol = "ETH"
+decimals = 18
+confirmations = 1
+fee_mode = "auto"

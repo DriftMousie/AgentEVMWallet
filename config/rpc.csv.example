@@ -1,0 +1,15 @@
+chain,name,url,priority,enabled
+ethereum,primary,,10,false
+ethereum,backup,,20,false
+base,primary,,10,false
+base,backup,,20,false
+arbitrum,primary,,10,false
+arbitrum,backup,,20,false
+optimism,primary,,10,false
+optimism,backup,,20,false
+polygon,primary,,10,false
+polygon,backup,,20,false
+bsc,primary,,10,false
+bsc,backup,,20,false
+sepolia,primary,,10,false
+sepolia,backup,,20,false
