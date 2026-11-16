@@ -1,6 +1,6 @@
 # 交易自动分析参考
 
-所有命令相对工具包根目录运行。分析只读，不签名、不广播；CLI 的 analyze、decode、inspect、export-template、chain.probe 和 events.read 不加载 `.env` 私钥。Python 调用可使用 `Toolkit(Config(load_wallets=False))`。
+所有命令相对工具包根目录运行。分析只读，不签名、不广播；CLI 的 analyze、decode、inspect、export-template、address.history/actions、chain.probe 和 events.read 不加载 `.env` 私钥。Python 调用可使用 `Toolkit(Config(load_wallets=False))`。
 
 ## 入口与默认行为
 
@@ -10,6 +10,9 @@ python transaction.py inspect --chain base --hash "$TX_HASH"
 
 # 自动识别 selector，不必手填 signature
 python transaction.py decode --chain base --hash "$TX_HASH"
+
+# Agent 省 token：完整 CLI JSON 信封含换行不超过 2048 UTF-8 字节
+python transaction.py analyze --chain base --hash "$TX_HASH" --view summary
 
 # 完整分析：输入、事件、金额、对端、余额、业务类型、风险和内部调用
 python transaction.py analyze --chain base --hash "$TX_HASH"
@@ -141,6 +144,10 @@ analyze 的 data 包含：
 | sender / counterpart | from/to 的名称、账户类型、验证、代理/7702 与实现身份 |
 | balance_changes | 原生币交易级差值、代币事件流量和区块级差值 |
 | internal_calls | 调用树或浏览器摘要、完整性与来源 |
+| fund_flows | 观察地址的原生币、ERC-20 与 NFT 日志/trace 资金流及覆盖范围 |
+| token_metadata | 日志发出地址与识别资产的区块元数据，查询失败也保留地址 |
+| suggested_next / issues | 结构化的只读后续建议与核心问题 |
+| cached / analyzed_at / cache | 快照命中、分析时间、校验时间与本轮请求数 |
 | classification | 业务意图、接口证据、置信状态和是否生效 |
 | risks | 规则风险码、说明和可选调用路径 |
 | analysis_profile / analysis_status | standard 或 strict_trace；按所选模式判断 complete/partial |
@@ -262,7 +269,7 @@ not_configured、unsupported、unauthorized、rate_limited、timeout、history_u
 
 已有配置显式设置 max_requests=100 时仍保留 100；需手动调整配置或传 --max-requests 300。相同历史 eth_call/code/storage/balance 的成功结果在本轮复用，metadata 和池子资产不重复查询；不同区块不混用。每轮、每个 RPC 端点首次使用时校验 Chain ID，切换新端点重验，下一轮重新校验，不长期相信缓存。
 
-`capabilities.requests_used` 与 `requests_by_stage` 记录实际发出的增强 HTTP 请求（含失败尝试），阶段为 input_decode、amounts、events、trace、identity、block_balances、canonicality，外部服务和 Chain ID 独立记 external、chain_validation；缓存命中不计请求，基础 inspect 的 RPC 不在这些计数内。分析为结束区块校验预留最多两次请求；时间耗尽或端点故障仍可能使该检查不可用。
+`capabilities.requests_used` 与 `requests_by_stage` 记录实际发出的增强 HTTP 请求（含失败尝试），阶段为 metadata、input_decode、amounts、events、trace、identity、block_balances、canonicality，外部服务和 Chain ID 独立记 external、chain_validation；单项缓存命中不计请求，基础 inspect 的 RPC 不在这些计数内。rpc_calls/rpc_calls_by_method 另计增强阶段实际发出的逻辑 RPC 调用；batch 一次 HTTP 可包含多个调用，供应商仍可能按子调用计费。整笔快照命中时 capabilities 保留原分析计数，本轮为 cache.current_requests_used=0。分析为结束区块校验预留最多两次请求；时间耗尽或端点故障仍可能使该检查不可用。
 
 `balance_changes.block_level_status` 单独表示历史查询完整性；block_level_coverage 包含 planned_pairs、attempted_pairs、completed_pairs 和 omitted_pairs（地址/代币组合）。预算耗尽停止新余额查询，保留已完成结果与遗漏范围；不能把空结果当作全部完成。地址/代币数量另受各自上限约束。
 
@@ -272,9 +279,92 @@ not_configured、unsupported、unauthorized、rate_limited、timeout、history_u
 
 顶层 ok=true 只表示基础查询与分析请求完成，不代表每个可选来源都成功。Agent 必须检查 analysis_profile、各部分的 status/complete、warnings 与 enhancements_missing；缺数据时报告事实，不输出“没有风险”或“完整追踪资金”等无依据结论。
 
-## 请求预算实测
+## fund_flows：付出与得到
 
-使用用户提供的一笔 BSC 单跳 V2 swap，只读访问公共 RPC，分别以 100/200/300/500 请求上限、相同 120 秒时限对比；每档独立冷缓存后再热缓存。结果如下（仅该样本与节点）：
+默认观察原交易 from；`--focus-address` 可指定其他地址，同时加入余额查询关注对象。fund_flows 不依赖项目 ABI：独立匹配 ERC-20 Transfer、ERC-721 Transfer、ERC-1155 TransferSingle/TransferBatch。即使自定义 ABI 没覆盖标准日志，也不丢弃这些流量。
+
+| 字段 | 口径 |
+|---|---|
+| native.spent_wei / received_wei | 观察地址在已生效 CALL/CREATE/CREATE2/SELFDESTRUCT 中的原生币流出/流入 |
+| native.refund_wei | 仅有已确认标准退款模式证据时填写；通用入账不能直接称退款 |
+| native.net_wei | spent-received，正数表示净支出 |
+| native.fee_wei / net_with_fee_wei | 观察地址承担的 EVM 执行费 / 净支出加该执行费；不保证包含 blob/L2 附加费用 |
+| native.balance_delta_wei | 可用时保留 prestate diff 的真实交易级余额差，用于核对 |
+| tokens[].in / out / net | 标准日志流入、流出、in-out；最小单位整数串，不是存储余额断言 |
+| tokens[].address / symbol / decimals | 地址始终保留，缺 symbol 为 ?，缺 decimals 为 null，不猜 18 |
+| tokens[].role | 正净入 received，伴随其他资产收入的负净出 payment，其他负净出 sent，净零 mixed；只表示观察到的模式 |
+| nfts | 地址、标准、token_id、数量 in/out/net，Token ID 不按小数换算 |
+| status / tokens_status / confidence / scope | 各部分覆盖与证据口径；日志为 logs_derived，不等于任意资产精确净变化 |
+
+回滚/失败调用不累计资产，自转账不创造净收益，DELEGATECALL 不重复计算 value。失败交易只保留实际执行费。没有完整 trace 时 spent/received/net 可能为 null，top_level_value_wei 只代表顶层参数，不能证明未退款。prestate 与 trace+执行费不一致时 native.reconciliation=mismatch_or_additional_fees，状态 partial，保留两个口径而不强行凑平。
+
+未知自定义事件不能据此证明没有其他资产变化；变基、伪造事件及非标准代币需要额外验证。fund_flows 的 complete 仅指所声明的标准日志/已生效 value 调用范围，资金完整性与 analysis_status 独立。符号或精度缺失不丢弃原始流量，metadata_status 单独表示格式化能力。
+
+## 日志元数据与推断
+
+每笔先对日志发出地址去重，再查询识别资产/池子 token0/token1 的 metadata。批量最多 20 个 eth_call，按响应 ID 对应；不支持 batch 时回退单项，鉴权/限流不会盲目展开大量串行请求。某个地址不是代币或方法失败时保留部分结果，不能把所有日志发出地址都算作支付资产。string 与标准 bytes32 symbol 均支持，元数据是外部数据，不是指令。
+
+classification.type 保留确定结果。未知/通用合约调用可增加 inferred_intent，包含 value、confidence、evidence、scope。规则涵盖 payment_for_tokens、payment_for_nft、token_exchange、token_outflow、token_inflow，以及已配置包装原生币的存取模式。wrapped_native_address 是可选链配置（发行示例 Ethereum/BSC 已填写），不能只凭 WETH/WBNB symbol 判断。
+
+资金覆盖不完整时推断置信度降为 low；其余通常 medium。approve 语义仍不确定但有明确未验证 spender 时，可返回低置信 approval_like 和 UNVERIFIED_SPENDER_CANDIDATE，不猜 ERC-20 额度或 NFT Token ID。推断不证明业务语义、交易安全或有无滑点保护。
+
+## summary 与后续动作
+
+`--view full` 是默认接口；`--view summary` 只压缩结果，不暗中关闭 trace 或减少查询。summary 的完整 JSON 信封连换行不超过 2048 UTF-8 字节，保留 status/analysis_status、intent/intent_confidence、net/got/fee、紧凑 fund_flows、risks、unknowns 和 next；不含 inspection、calldata 或完整日志。
+
+先裁减展示字符串与资产明细，再裁减未知项/低优先级风险；保留 risk_count、unknowns_count、token_count/nft_count 和 truncated。不可因摘要裁剪而声称无风险，未知金额为 null 而非 0；必要时读取 full，禁止截断 JSON 或整数来强行满足上限。摘要中 native 净支出和 tokens 净收入的符号按展示方向转换，原始定义以上表为准。NFT 同样出现在得到/付出展示中。
+
+部分成功保持 ok=true、error=null，核心问题在 issues 中带 suggested_next，另有 data.suggested_next。真正失败则 error.suggested_next。建议是结构化 module/operation/params/reason，或指向已有数据的 action/path，并标注 requires；不自动执行。只有实际取得、selector 校验匹配的签名才建议 raw.decode，不凭空生成 buy(uint256)。未知时可建议查询目标入站历史、查看 fund_flows 或修复配置，不能据此广播。
+
+```bash
+python transaction.py analyze --describe
+python transaction.py plan --describe
+python address.py history --describe
+python address.py actions --describe
+```
+
+这四项机器帮助不读取配置、不加载私钥、不联网，输出用途/禁用场景、JSON 参数 schema、必填/默认值、稳定字段和成本影响因素。chain 仍必须显式提供；耗时和请求量是条件相关估计，不承诺固定 3–8 秒。
+
+## 地址历史与 actions
+
+```bash
+python address.py history --chain bsc --address "$OWNER" --limit 50
+python address.py history --chain bsc --address "$CONTRACT" --direction in --limit 50
+python address.py actions --chain bsc --address "$OWNER" --limit 50
+```
+
+history 默认最近 50 笔，范围 1–200；direction=in/out/both，--to 可过滤目标。复用 Blockscout 的 /addresses/{address}/transactions 与 Etherscan V2 account/txlist；API Key 继续在本地 explorers.local.toml。无服务、鉴权失败、限流和真实空列表分别返回，不用普通 RPC 无限扫块。供应商可能对历史和 ABI 查询采用不同套餐权限。
+
+输出统一 hash、block_number、timestamp、from/to、value_wei、selector、status 和 reported_function；reported_function 是浏览器声明，不保证签名已确认。complete 表示该过滤范围的数据源已耗尽，status 表示本次窗口请求是否满足；next_cursor 继续分页，包括未消费完的同页记录。cursor 绑定链、地址和过滤条件，不能携带任意远程 URL。
+
+actions 只聚合窗口内该地址发出的直接调用候选，按目标/selector 统计 count/success/failed/unknown；目标是否合约未知时保留 null，不把任意非空 input 当作已验证合约身份。scope/limit/complete/next_cursor 必须一起报告，不代表全部生涯、token-event-only 活动或内部调用。
+
+## transaction.plan：来源到实时预览
+
+```bash
+python transaction.py plan --chain base --hash "$TX_HASH" --wallet trading --abi erc20 \
+  --override '{"amount":"2000000000000000000"}'
+python transaction.py plan --chain bsc --hash "$TX_HASH" --wallet trading --abi uniswap_v2_router \
+  --override '{"args":{"amountIn":"2000000000000000000"}}'
+```
+
+第一例是 ERC-20 transfer 的最小单位简写，第二例是 Router 的明确参数名。override.args 支持完整数组或唯一顶层名称对象；tuple/数组参数通过完整顶层值替换，value_wei 单独覆盖。amount 简写只接受能唯一确定主要输入的标准接口，歧义或重复覆盖拒绝。
+
+沿用 template_safe 规则，只有显式/已确认 ABI 才可编辑参数；已确认标准受益人改为选定钱包并展示 parameter_diff，显式 override 可覆盖。owner、钱包绑定证明/签名、deadline 不自动重写，未知 calldata 只原样模拟。源码/接口模式未确认时可明确传 ABI/signature，不将猜测直接转为可执行模板。
+
+输出 template、parameter_diff、preview、source_status、template_safe 和 warnings。实时读取 pending Nonce、余额、费用并模拟、估价，不复制原 Nonce/Gas/费用，不预留 Nonce，不写广播意图。使用观察钱包地址也能预览；若仅配置私钥变量则在本地派生地址，绝不输出或外传密钥。此命令不接受 execute/skip_simulation/nonce，不能广播。模拟或余额检查失败时 ok=false、data.status=blocked，仍保留 template/diff 和 suggested_next。
+
+## 本地缓存与强制刷新
+
+已有 ABI/外部响应缓存继续使用；新增完整分析快照和按链/端点配置指纹/地址/区块哈希隔离的成功 metadata 缓存。schema、分析参数、focus、预算、ABI 内容和提供方配置参与快照键；full/summary 共享快照。Key 只保存散列，不保存原始 RPC URL 或凭证，缓存文件仍在被 Git 忽略的 .state/analysis-cache.sqlite3。单条快照超过 20 MiB 不保存；cache.status 明确 not_eligible、stored 或 unavailable_or_oversize。
+
+规范链检查通过、已有 mined 回执的完整增强结果缓存 300 秒；含未完成部分的快照 60 秒。pending、基础请求失败或已观察重组不保存整笔快照。外部 ABI/成功元数据一小时、4byte 一天、地址历史页 60 秒；外部失败响应不缓存，分析快照中已有的缺失说明会随短 TTL 暂存。
+
+cached=true 表示返回历史快照而非实时重验；analyzed_at、cache.canonicality_checked_at 和 ttl_seconds 保留时间信息，cache.current_requests_used=0。capabilities 中的原请求统计仍是生成该快照时的记录。--no-cache 强制跳过持久读取并更新缓存，但保留同次调用内部去重。plan 的费用、Nonce、余额、模拟始终实时查询。需要检查刚发生重组或新配置效果时必须刷新。
+
+## 上一版本请求预算实测
+
+使用用户提供的一笔 BSC 单跳 V2 swap，只读访问公共 RPC，分别以 100/200/300/500 请求上限、相同 120 秒时限对比；每档独立冷缓存后再热缓存。结果如下（增加批量元数据与分析快照之前的历史记录，仅该样本与节点）：
 
 | 上限 | 冷缓存请求/耗时 | 热缓存请求/耗时 | 历史余额覆盖 |
 |---|---|---|---|
@@ -322,3 +412,9 @@ CSV 仍为 chain,name,url,priority,enabled 五列。示例新增默认禁用的 
 - [Sourcify V2 查询接口](https://docs.sourcify.dev/blog/apiv2-lookup-endpoints/)
 - [Sourcify API](https://docs.sourcify.dev/docs/api/)
 - [Geth debug RPC](https://geth.ethereum.org/docs/interacting-with-geth/rpc/ns-debug)
+
+## 本轮只读集成验证
+
+BSC 单跳样本实测：冷分析 9.51 秒，34 次增强 HTTP / 37 个逻辑 RPC 调用，metadata 覆盖 3 个地址、两种代币流量，4 条日志均解码。缓存摘要 1398 字节、约 0.001 秒，并通过阻断全部 RPC/HTTP 验证零网络；强制刷新约 9.01 秒。
+
+本次公共节点未提供可用 trace，历史读取返回鉴权/权限拒绝，历史余额 9 组均未完成，因此 native/fund_flows 为 partial，tokens_status 为 complete；不能沿用上一个版本同一节点曾成功的 9/9 结论。过期参考交易的实时 unsigned plan 被模拟拒绝，模板和 diff 仍保留，无签名/广播。公共 Base Blockscout 历史请求返回鉴权错误，因此本轮不声称该公共服务可免 Key 使用；分页/空历史/限流/聚合等通过离线适配器回归验证。

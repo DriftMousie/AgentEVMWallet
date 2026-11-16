@@ -17,9 +17,10 @@ from .diagnostics import missing, combine
 
 
 class Sources:
-    def __init__(self, config, chain, budget, enabled=True, max_pages=10):
+    def __init__(self, config, chain, budget, enabled=True, max_pages=10, no_cache=False):
         self.config, self.chain, self.budget = config, chain, budget
         self.enabled, self.max_pages = enabled, max_pages
+        self.no_cache = no_cache
         self.warnings, self.memo, self.enhancements_missing = [], {}, []
         settings = config.raw.get("explorers", {})
         path = Path(settings.get("config_file", "explorers.toml"))
@@ -70,7 +71,7 @@ class Sources:
             connection = sqlite3.connect(self.cache, timeout=2)
             connection.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, expires REAL, data TEXT)")
             row = connection.execute("SELECT data FROM cache WHERE key=? AND expires>?", (key, time.time())).fetchone()
-            if row:
+            if row and not self.no_cache:
                 value = json.loads(row[0]); self.memo[key] = value; return value
         except (OSError, sqlite3.Error, ValueError):
             self.warn("CACHE_UNAVAILABLE")
@@ -81,7 +82,8 @@ class Sources:
         data = json_request("GET", url, params=query, timeout=min(10, self.budget.spend("external")))
         require(not api_key or api_key not in json.dumps(data), "Optional provider reflected credentials; response discarded", "SOURCE_UNAVAILABLE")
         failure = provider_error_code(data)
-        if failure:
+        empty_history = isinstance(data,dict) and (params or {}).get("module")=="account" and (params or {}).get("action")=="txlist" and data.get("status") == "0" and data.get("result") == [] and str(data.get("message","")).lower() in ("no transactions found", "no records found")
+        if failure and not empty_history:
             raise ToolError(failure, "Optional provider returned an error; response not cached")
         self.memo[key] = data
         try:

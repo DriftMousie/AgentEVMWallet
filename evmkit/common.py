@@ -99,7 +99,9 @@ def jsonable(value: Any):
     if isinstance(value, int):
         return str(value)
     if isinstance(value, dict) or hasattr(value, "items"):
-        structural = {"schema_version", "chain_id", "decimals", "confirmations", "data_bytes", "completed_through", "latency_ms", "failed_step"}
+        structural = {"schema_version", "chain_id", "decimals", "confirmations", "data_bytes", "completed_through", "latency_ms", "failed_step",
+                      "returned","limit","pages","count","success","failed","unknown","non_call_transactions","token_count","nft_count","risk_count","unknowns_count",
+                      "requests_used","current_requests_used","rpc_calls","ttl_seconds","planned_pairs","attempted_pairs","completed_pairs","summary_max_utf8_bytes"}
         return {str(k): v if k in structural and isinstance(v, int) and not isinstance(v, bool) else jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [jsonable(v) for v in value]

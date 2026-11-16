@@ -1,0 +1,113 @@
+"""Actionable diagnostics and a hard byte-bounded conclusion view."""
+import json
+from web3 import Web3
+
+
+def suggested_next(params, data=None, code=None):
+    params=params if isinstance(params,dict) else {}
+    data=data if isinstance(data,dict) else {}
+    chain,hash_=params.get("chain"),params.get("hash")
+    steps=[]
+    inspected=data.get("inspection",{})
+    tx=inspected.get("transaction",{})
+    decoded=data.get("input_decode",data.get("decoded",{})) or {}
+    for item in decoded.get("candidates",[])[:3]:
+        signature=item.get("signature")
+        if signature and tx.get("data") and Web3.to_hex(Web3.keccak(text=signature)[:4])==tx["data"][:10]:
+            steps.append({"module":"raw","operation":"decode","params":{"data":tx["data"],"signature":signature},
+                          "reason":"Try a selector-matching candidate; decoded arguments do not prove semantics"})
+    if tx.get("to") and chain and decoded.get("status") not in ("decoded","empty","onchain_message","data_only"):
+        steps.append({"module":"address","operation":"history","params":{"chain":chain,"address":tx["to"],"direction":"in","limit":50},
+                      "requires":["configured_explorer"],"reason":"Inspect recent callers/selectors without inventing a function name"})
+    if data.get("fund_flows"):
+        steps.append({"action":"inspect_fund_flows","path":"data.fund_flows","reason":"Observed asset movements remain useful independently of the unknown function"})
+    if code in ("SOURCE_UNCONFIGURED","CONFIG_ERROR","SOURCE_UNAUTHORIZED"):
+        steps.append({"action":"check_configuration","files":["config/settings.toml","config/explorers.toml","config/explorers.local.toml"],
+                      "reason":"Check enabled provider, required local key and account permissions; never print credential values"})
+    if code in ("CALL_REVERTED","TOKEN_OPERATION_FAILED") and data.get("template"):
+        steps.append({"action":"inspect_plan_diff","reason":"Check recipient, owner, deadline, wallet-bound proof/signature and current balances; do not bypass the failed simulation"})
+    if code in ("RPC_UNAVAILABLE","SOURCE_TIMEOUT","SOURCE_RATE_LIMITED") and chain and hash_:
+        steps.append({"module":"transaction","operation":"analyze","params":{"chain":chain,"hash":hash_,"no_cache":True,"view":"summary"},
+                      "reason":"Retry the read after restoring provider availability or waiting for the rate limit"})
+    if not steps:
+        steps.append({"action":"inspect_parameters","reason":"Check the documented required fields and the exact error; do not guess addresses, signatures or monetary units"})
+    return steps[:5]
+
+
+def _quantity(raw,decimals,symbol,location=None):
+    value=int(raw)
+    if decimals is None:
+        text=str(abs(value))+" raw"
+    elif decimals==0:
+        text=str(abs(value))
+    else:
+        digits=str(abs(value)).zfill(decimals+1)
+        text=(digits[:-decimals]+"."+digits[-decimals:]).rstrip("0").rstrip(".")
+    label=(symbol or "?")[:24]
+    if location: label += " @"+location[:8]+"…"+location[-4:]
+    return ("+" if value>0 else "-" if value<0 else "")+text+" "+label
+
+
+def summary_envelope(response):
+    """Bound the complete serialized CLI envelope, including its trailing newline."""
+    original=response.get("data") or {}
+    original=original if isinstance(original,dict) else {}
+    flows=original.get("fund_flows",{})
+    native=flows.get("native",{})
+    classification=original.get("classification",{})
+    inferred=classification.get("inferred_intent") or {}
+    tokens=flows.get("tokens",[]);nfts=flows.get("nfts",[])
+    decoded=original.get("input_decode",{})
+    unknowns=[]
+    if native.get("status")=="partial": unknowns.append("native_flow:"+native.get("reconciliation","incomplete"))
+    if decoded.get("status") not in (None,"decoded","empty","onchain_message","data_only"):
+        unknowns.append("function_selector_"+str(decoded.get("selector") or "unknown"))
+    custom=sum(e.get("decoded",{}).get("status")!="decoded" for e in original.get("decoded_events",[]))
+    if custom: unknowns.append(str(custom)+" unresolved events")
+    unknowns.extend(dict.fromkeys(str(w) for w in original.get("warnings",[])+response.get("warnings",[])))
+    unknowns.extend(dict.fromkeys(e["capability"]+":"+e["reason"] for e in original.get("enhancements_missing",[])))
+    risks=sorted(original.get("risks",[]),key=lambda r:{"critical":0,"high":1,"warning":2,"medium":3,"info":4}.get(r.get("severity"),5))
+    net=[];got=[]
+    if native.get("net_wei") is not None and int(native["net_wei"])!=0:
+        target=net if int(native["net_wei"])>0 else got
+        target.append(_quantity(-int(native["net_wei"]),native["decimals"],native.get("symbol")))
+    for row in tokens:
+        value=int(row["net"])
+        if value: (got if value>0 else net).append(_quantity(value,row.get("decimals"),row.get("symbol"),row["address"]))
+    for row in nfts:
+        value=int(row["net"])
+        if value: (got if value>0 else net).append(("+" if value>0 else "-")+str(abs(value))+" NFT #"+row["token_id"]+" @"+row["address"])
+    status=original.get("analysis_status","failed" if not response["ok"] else "partial")
+    body={"view":"summary","status":status,"analysis_status":status,
+          "intent":inferred.get("value") if classification.get("type") in (None,"unknown","contract_call") else classification["type"],
+          "intent_confidence":inferred.get("confidence") or classification.get("confidence"),
+          "net":"; ".join(net) if net else None,"got":"; ".join(got) if got else None,
+          "fee":_quantity(native["fee_wei"],native["decimals"],native.get("symbol")) if native.get("fee_wei") is not None else None,
+          "fee_scope":"EVM execution only",
+          "fund_flows":{"status":flows.get("status","unavailable"),"focus_address":flows.get("focus_address"),
+                        "native":{k:native.get(k) for k in ("net_wei","fee_wei","balance_delta_wei")},
+                        "tokens":[{k:r.get(k) for k in ("address","decimals","net","role")} for r in tokens],
+                        "nfts":[{k:r.get(k) for k in ("address","token_id","net")} for r in nfts]},
+          "token_count":len(tokens),"nft_count":len(nfts),"risk_count":len(risks),"unknowns_count":len(unknowns),
+          "risks":[{"code":r["code"],"severity":r.get("severity")} for r in risks],"unknowns":unknowns,
+          "next":"Inspect full fund_flows, risks and unknowns before reusing calldata", "truncated":False,
+          "cached":original.get("cached",False),"analyzed_at":original.get("analyzed_at")}
+    error=response.get("error")
+    if error: error={k:error.get(k) for k in ("code","message","retryable")}
+    out={**response,"wallet":None,"data":body,"warnings":[],"error":error}
+    def size():return len((json.dumps(out,ensure_ascii=False,separators=(",",":"))+"\n").encode("utf-8"))
+    if error: error["message"]=str(error.get("message", ""))[:160];error["suggested_next"]=[{"action":"inspect_error_and_full_view"}]
+    buckets=[body["fund_flows"]["tokens"],body["fund_flows"]["nfts"],body["unknowns"],body["risks"]]
+    while size()>2048:
+        body["truncated"]=True
+        if body["net"] is not None or body["got"] is not None:
+            body["net"],body["got"]=None,None;continue
+        bucket=next((b for b in buckets if b),None)
+        if bucket is not None: bucket.pop();continue
+        body["fee"]=None
+        if error: error["message"]="See full view for error details"
+        if size()>2048:
+            body={k:body[k] for k in ("view","status","analysis_status","intent","risk_count","unknowns_count","token_count","nft_count","truncated","next")}
+            out["data"]=body
+        break
+    return out

@@ -98,8 +98,8 @@ def canonical(item):
 
 
 def load_abi(value):
-    if isinstance(value, str) and value in ("erc20", "erc721", "erc1155", "weth", "erc4626"):
-        from .standards import preset
+    from .standards import PRESETS,preset
+    if isinstance(value, str) and value in PRESETS:
         return preset(value)
     data = read_json(value) if isinstance(value, str) else value
     if isinstance(data, dict): data = data.get("abi")

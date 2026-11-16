@@ -9,9 +9,9 @@ from .common import ToolError, jsonable, result, require, wallet_selectors
 from .config import Config
 from .operations import OPS, Toolkit
 
-JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types"}
-BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer"}
-NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses"}
+JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types", "override"}
+BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache"}
+NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses", "limit"}
 
 
 class ParseError(Exception): pass
@@ -42,17 +42,26 @@ def main(module, argv=None):
     for name, fields in OPS[module].items():
         sub = subs.add_parser(name, help=f"{module}.{name}")
         runtime(sub)
+        from .describe import SUPPORTED
+        if (module,name) in SUPPORTED: sub.add_argument("--describe",action="store_true",default=argparse.SUPPRESS,help="Static machine-readable JSON help; no configuration or network needed")
         for field in sorted(fields):
             kwargs = {"default": argparse.SUPPRESS}
             if field == "wallets":
                 sub.add_argument("--wallets", "--wallet", dest="wallets", action=WalletsAction,
                                  default=argparse.SUPPRESS, help='Wallet IDs/labels: trading,treasury or JSON ["trading","treasury"]')
                 continue
-            if field in BOOL_FIELDS:
+            if field == "no_cache":
+                kwargs["action"]="store_true"
+                kwargs["help"]="Refresh persistent caches; within-request deduplication remains enabled"
+            elif field in BOOL_FIELDS:
                 kwargs["action"] = argparse.BooleanOptionalAction
             elif field in JSON_FIELDS:
                 kwargs["type"] = json.loads
-                kwargs["help"] = "JSON array"
+                kwargs["help"] = "JSON object" if field=="override" else "JSON array"
+            elif field == "view":
+                kwargs["choices"]=["summary","full"]
+            elif field == "direction":
+                kwargs["choices"]=["in","out","both"]
             elif field in NUM_FIELDS:
                 kwargs["type"] = int
             elif field == "abi":
@@ -65,6 +74,12 @@ def main(module, argv=None):
     try:
         opts = vars(parser.parse_args(argv))
         operation = opts.pop("operation")
+        if opts.pop("describe",False):
+            from .describe import describe
+            response=result(module+"."+operation+".describe")
+            response["data"]=describe(module,operation)
+            print(json.dumps(response,ensure_ascii=False,separators=(",",":")))
+            return 0
         config_options = {k: opts.pop(k) for k in ("config", "env_file", "state_dir") if k in opts}
         source = opts.pop("input_json", None)
         if source is not None:
@@ -81,7 +96,7 @@ def main(module, argv=None):
             require(operation is None or operation == request["operation"], "Operation differs from JSON input")
             operation, opts = request["operation"], request["params"]
         require(operation is not None, "Provide a subcommand or --input-json")
-        analysis_only = module == "events" or module == "chain" and operation == "probe" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
+        analysis_only = module in ("events","address") or module == "chain" and operation == "probe" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
         config = Config(path=config_options.get("config"), env_file=config_options.get("env_file"), state_dir=config_options.get("state_dir"), load_wallets=not analysis_only)
         response = Toolkit(config).run(module, operation, opts)
     except (ParseError, ToolError) as exc:
@@ -89,5 +104,8 @@ def main(module, argv=None):
                                         "message": str(exc), "retryable": False})
     except Exception:
         response = result(module, error={"code": "INVALID_INPUT", "message": "Unable to process request", "retryable": False})
+    if response.get("error") and "suggested_next" not in response["error"]:
+        from .agent_output import suggested_next
+        response["error"]["suggested_next"]=suggested_next({},response.get("data"),response["error"]["code"])
     print(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
     return 0 if response["ok"] else 1

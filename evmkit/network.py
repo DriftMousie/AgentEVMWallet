@@ -23,6 +23,13 @@ class Budget:
         self.by_stage = {}
         self.validated_rpcs = set()
         self.reserve_requests = 0
+        self.rpc_calls = 0
+        self.rpc_by_method = {}
+        self.batch_disabled = set()
+
+    def record_rpc(self, method, count=1):
+        self.rpc_calls += count
+        self.rpc_by_method[method] = self.rpc_by_method.get(method,0) + count
 
     def remaining(self):
         left = self.deadline - time.monotonic()
@@ -51,6 +58,8 @@ def json_request(method, url, *, timeout=10, params=None, payload=None, max_byte
                 raise ToolError("SOURCE_NOT_FOUND", "Optional data source has no record", retryable=True)
             if response.status_code in (401, 403):
                 raise ToolError("SOURCE_UNAUTHORIZED", "Optional data source requires different credentials or permissions")
+            if response.status_code in (400,405,413) and isinstance(payload,list):
+                raise ToolError("CAPABILITY_UNAVAILABLE","RPC batch transport rejected; individual reads may still work")
             require(response.status_code == 200, "Optional data source request failed", "SOURCE_UNAVAILABLE")
             parts, size = [], 0
             for chunk in response.iter_content(65536):

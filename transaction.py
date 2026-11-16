@@ -6,4 +6,5 @@ else:
         """Return the same JSON-compatible envelope as CLI."""
         from evmkit.config import Config
         from evmkit.operations import Toolkit
-        return Toolkit(config or Config()).run("transaction", operation, params)
+        readonly={"analyze","decode","inspect","status","wait","gas","export-template"}
+        return Toolkit(config or Config(load_wallets=operation not in readonly)).run("transaction", operation, params)

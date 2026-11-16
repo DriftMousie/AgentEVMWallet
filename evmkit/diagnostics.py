@@ -15,7 +15,8 @@ CAPABILITIES = {"CALL_TRACE": "internal_calls", "INTERNAL_CALLS": "internal_call
                 "TOKEN_METADATA_PARTIAL": "token_metadata", "CALL_TRACE_TRUNCATED": "internal_calls",
                 "BLOCK_PRE_BALANCE": "block_balances", "BLOCK_POST_BALANCE": "block_balances",
                 "BALANCE_ADDRESSES_TRUNCATED": "block_balances", "BALANCE_TOKENS_TRUNCATED": "block_balances",
-                "BLOCK_BALANCES": "block_balances", "POOL_ASSETS": "pool_assets", "ROUTE_AMOUNTS": "route_amounts"}
+                "BLOCK_BALANCES": "block_balances", "POOL_ASSETS": "pool_assets", "ROUTE_AMOUNTS": "route_amounts",
+                "TOKEN_METADATA":"token_metadata"}
 SPECIAL_REASONS = {"TOKEN_METADATA_PARTIAL": "incomplete", "CALL_TRACE_TRUNCATED": "truncated",
                    "BALANCE_ADDRESSES_TRUNCATED": "truncated", "BALANCE_TOKENS_TRUNCATED": "truncated",
                    "CACHE_UNAVAILABLE": "unavailable"}

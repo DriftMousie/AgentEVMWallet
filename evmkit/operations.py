@@ -16,7 +16,7 @@ from .rpc import RPC
 
 WRITE = {"execute", "gas", "gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "skip_simulation", "reason", "wait", "timeout", "confirmations"}
 BASE = {"chain", "wallet"}
-ANALYSIS = {"external", "trace", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses"}
+ANALYSIS = {"external", "trace", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses", "no_cache"}
 # This registry drives both the Python API and the CLI, including unknown-field rejection.
 OPS = {
     "chain": {"list": set(), "health": {"chain"}, "block": {"chain", "block"}, "fees": {"chain"},
@@ -28,7 +28,8 @@ OPS = {
                     "nonce": BASE | {"address"}, "gas": {"chain"},
                     "wait": {"chain", "hash", "confirmations", "timeout"},
                     "decode": {"chain", "hash", "abi", "signature"} | ANALYSIS,
-                    "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses", "require_trace"} | ANALYSIS,
+                    "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses", "require_trace", "focus_address", "view"} | ANALYSIS,
+                    "plan": {"chain","hash","wallet","abi","signature","override","gas","gas_price_wei","max_fee_per_gas_wei","max_priority_fee_per_gas_wei"} | ANALYSIS,
                     "export-template": {"chain", "hash", "abi", "signature", "output"} | ANALYSIS,
                     "accelerate": BASE | WRITE | {"hash"}, "cancel": BASE | WRITE | {"hash"},
                     "replay": BASE | {"hash", "execute", "wait", "confirmations", "timeout"}},
@@ -57,6 +58,8 @@ OPS = {
                 "verify-message": {"message", "signature", "address"},
                 "verify-typed": {"typed_data", "signature", "address"}},
     "batch": {"run": {"items", "file", "execute", "continue_on_error"}},
+    "address": {"history":{"chain","address","limit","direction","to","cursor","no_cache","max_pages","max_requests","time_budget_seconds"},
+                "actions":{"chain","address","limit","direction","to","cursor","no_cache","max_pages","max_requests","time_budget_seconds"}},
 }
 
 
@@ -108,6 +111,15 @@ class Toolkit:
         return uint(p["decimals"]) if p.get("decimals") is not None else self.call(p, p["token"], "decimals()", [], ["uint8"])
 
     def run(self, module, operation, params):
+        response=self._run(module,operation,params)
+        from .agent_output import suggested_next,summary_envelope
+        if response.get("error"):
+            response["error"]["suggested_next"]=suggested_next(params,response.get("data"),response["error"]["code"])
+        if module=="transaction" and operation=="analyze" and isinstance(params,dict) and params.get("view")=="summary":
+            return summary_envelope(response)
+        return response
+
+    def _run(self, module, operation, params):
         self.warnings = []
         name = f"{module}.{operation}"
         chain_id, wallet = None, None
@@ -115,7 +127,7 @@ class Toolkit:
             require(module in OPS and operation in OPS[module], "Unknown operation")
             require(isinstance(params, dict), "params must be an object")
             require(not (set(params) - OPS[module][operation]), "Unknown operation parameters")
-            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer"):
+            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache"):
                 if key in params: require(isinstance(params[key], bool), f"{key} must be boolean")
             if params.get("chain"):
                 chain_id = self.config.chain(params["chain"])["chain_id"]
@@ -275,12 +287,44 @@ class Toolkit:
                 "analysis_status": "partial" if warnings else "complete", "enhancements_missing": enhancements}
 
     def transaction_analyze(self, p):
+        import time
         from .analysis import Analyzer
+        from .cache import SnapshotCache,analysis_key
+        require(p.get("view","full") in ("summary","full"),"view must be summary or full")
+        self.config.chain(p.get("chain"));txhash(p["hash"])
+        if p.get("focus_address"): address(p["focus_address"],field="focus_address")
+        cache=SnapshotCache(self.config);key=analysis_key(self.config,p)
+        hit=cache.get(key) if not p.get("no_cache") else None
+        if hit:
+            hit["cached"]=True
+            hit["cache"]["current_requests_used"]=0
+            self.warnings.extend(hit.get("warnings",[]))
+            return hit
         inspected = self.transaction_inspect(p)
         chain, rpc = self.rpc(p)
         result_ = Analyzer(self.config, chain, rpc, p, inspected).run()
+        result_.update(cached=False,analyzed_at=time.time(),cache={"canonicality_checked_at":time.time() if result_["balance_changes"].get("canonicality")=="verified" else None,"current_requests_used":result_["capabilities"]["requests_used"],"status":"not_eligible"})
+        if inspected.get("receipt") and result_["balance_changes"].get("canonicality")=="verified" and inspected["status"]!="reorged":
+            ttl=300 if result_["analysis_status"]=="complete" and not result_["enhancements_missing"] and result_["fund_flows"]["status"]=="complete" else 60
+            result_["cache"]["ttl_seconds"]=ttl
+            result_["cache"]["status"]="stored"
+            if not cache.put(key,result_,ttl): result_["cache"]["status"]="unavailable_or_oversize"
+        if not cache.available:
+            result_["enhancements_missing"].append({"capability":"cache","source":"local","reason":"unavailable","message":"Local analysis snapshot cache is unavailable"})
         self.warnings.extend(result_["warnings"])
         return result_
+
+    def transaction_plan(self,p):
+        from .planning import plan
+        return plan(self,p)
+
+    def address_history(self,p):
+        from .history import history
+        return history(self.config,self.config.chain(p.get("chain")),p)
+
+    def address_actions(self,p):
+        from .history import actions
+        return actions(self.config,self.config.chain(p.get("chain")),p)
 
     def transaction_export_template(self, p):
         source = self.transaction_decode(p)
@@ -596,6 +640,7 @@ class Toolkit:
                 continue
             analyzer.block = hex(row["blockNumber"])
             analyzer.memo = block_memos.setdefault(analyzer.block, {})
+            analyzer.memo["block_hash"]=Web3.to_hex(row["blockHash"]) if not isinstance(row["blockHash"],str) else row["blockHash"]
             row["decoded"] = analyzer.attempt(lambda: analyzer.decode_event(row, p.get("abi")), "EVENT_DECODE", required=True) or {"status": "unknown", "event": None, "args": None}
             if row["decoded"].get("status") != "decoded": analyzer.issue("EVENTS_UNRESOLVED", required=True)
         warnings, enhancements = analyzer.diagnostics()

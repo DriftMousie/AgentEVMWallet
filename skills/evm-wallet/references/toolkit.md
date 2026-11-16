@@ -2,7 +2,7 @@
 
 本文中的命令和文件路径均相对用户提供的工具包根目录，不是本参考文档或 Skill 的安装目录。先定位工具包，再执行命令。
 
-面向 Hermes Agent 的本地 EOA 钱包工具包。12 个 Python 文件可独立运行，公共实现位于 `evmkit/`。默认只预览，显式 `--execute` 才签名或广播。
+面向 Hermes Agent 的本地 EOA 钱包工具包。13 个 Python 文件可独立运行，公共实现位于 `evmkit/`。默认只预览，显式 `--execute` 才签名或广播。
 
 ## 环境与初始化
 
@@ -68,9 +68,10 @@ TOML 的 `[rpc] csv_file = "rpc.csv"` 指定 CSV 路径，相对路径以 TOML �
 | 文件 | 子命令 |
 |---|---|
 | `chain.py` | `list`、`health`、`probe`、`block`、`fees` |
+| `address.py` | `history`、`actions` |
 | `wallet.py` | `list`、`validate`、`balance`、`balances` |
 | `token.py` | `info`、`convert` |
-| `transaction.py` | `inspect`、`status`、`nonce`、`gas`、`wait`、`decode`、`analyze`、`export-template`、`accelerate`、`cancel`、`replay` |
+| `transaction.py` | `inspect`、`status`、`nonce`、`gas`、`wait`、`decode`、`analyze`、`plan`、`export-template`、`accelerate`、`cancel`、`replay` |
 | `contract.py` | `functions`、`encode`、`decode`、`call`、`write` |
 | `transfer.py` | `native`、`erc20` |
 | `approve.py` | `allowance`、`set`、`revoke` |
@@ -214,6 +215,29 @@ python raw.py call --chain base --to 0x0000000000000000000000000000000000000001 
 
 `--data` 接受偶数长度的 `0x` 十六进制数据；函数签名必须完整，使用 `uint256` 等规范类型。动态参数、tuple 和数组均按 ABI 编码，不做十六进制字符串替换。
 
+## Agent 查询与一步预览
+
+```bash
+# 静态 JSON 描述不需要任何配置或联网
+python transaction.py analyze --describe
+python transaction.py plan --describe
+python address.py history --describe
+python address.py actions --describe
+
+python transaction.py analyze --chain bsc --hash "$TX_HASH" --view summary
+python transaction.py analyze --chain bsc --hash "$TX_HASH" --view full --no-cache
+python transaction.py analyze --chain bsc --hash "$TX_HASH" --focus-address "$OWNER"
+python address.py history --chain bsc --address "$OWNER" --limit 50
+python address.py history --chain bsc --address "$CONTRACT" --direction in --limit 50
+python address.py actions --chain bsc --address "$OWNER" --limit 50
+python transaction.py plan --chain base --hash "$TX_HASH" --wallet trading --abi erc20 \
+  --override '{"amount":"2000000000000000000"}'
+```
+
+最后一个例子针对已确认 ERC-20 transfer：amount 是代币最小单位，不是整枚数量。通用覆盖形式是 override.args（完整参数数组或唯一参数名映射）和 override.value_wei；Router 可以显式提供 --abi uniswap_v2_router。自定义签名未知时只能原样模拟，不能猜参数。plan 自动修改已确认标准受益人，展示 parameter_diff；不会修改 owner/证明/签名/deadline，不接受 execute、nonce 或 skip_simulation。它在当前 pending 状态实时模拟、估费、查询 Nonce，不签名、不广播、不写交易意图记录；失败保留模板/diff，ok=false、status=blocked。
+
+fund_flows、摘要裁剪、推断、缓存和历史窗口的字段定义见 [自动分析参考](analysis.md)。summary 的完整 CLI 信封最多 2048 UTF-8 字节，默认仍 full。错误的 suggested_next 和部分成功的 issues/suggested_next 是后续建议，不自动运行或重复业务操作。
+
 ## JSON 与 Python 接口
 
 ```bash
@@ -229,7 +253,7 @@ echo '{"operation":"convert","params":{"amount":"1.25","decimals":6}}' | python 
 {"schema_version":1,"ok":true,"operation":"token.convert","chain_id":null,"wallet":null,"data":{"amount_raw":"1250000","amount":"1.25","decimals":6},"warnings":[],"error":null}
 ```
 
-失败时 `ok=false`，`error` 包含 `code`、`message`、`retryable`，退出码为 1；成功为 0。大整数、链上金额与 Token ID 为字符串，协议版本、链 ID、精度、确认数等结构字段为整数。RPC 原始字段中的整数按字符串输出。
+失败时 `ok=false`，`error` 包含 `code`、`message`、`retryable` 和结构化 `suggested_next`，退出码为 1；成功为 0。大整数、链上金额与 Token ID 为字符串，协议版本、链 ID、精度、确认数等结构字段为整数。RPC 原始字段中的整数按字符串输出。
 
 ```python
 from evmkit.config import Config
@@ -277,5 +301,7 @@ python batch.py run --file examples/batch.json --execute
 发布目录仅包含运行代码、配置模板、用法示例和 Agent 文档，不附带开发测试代码、夹具或测试指南。
 
 `chain probe` 是有预算的只读实时探测，不缓存可用性，不签名、不广播、不加载私钥；即使没有启用的 RPC 也可探测已配置的数据源。CSV 仍严格使用五列；`bsc` 的 trace/archive 提示行默认禁用，须填写自己有权限的 URL 后才启用。历史分析需要 `debug_traceTransaction` 的两个 tracer，`debug_traceCall` 只用于独立模拟探测。不要假设公共 RPC 或供应商免费档支持 debug；套餐、配额、归档范围见 [自动分析参考](analysis.md)。
+
+地址历史使用已配置 Blockscout/Etherscan 普通交易 API；BSC 的历史权限可能与 ABI 查询权限不同，需要核对供应商计划，不提供无限 RPC 扫块。没有配置时返回 SOURCE_UNCONFIGURED，不把它当作无历史。
 
 当前不含 MCP、智能账户写入、部署、资产/授权全量索引、桥、市场、调度和任务恢复；只读内部调用分析属于可选增强能力。完整设计记录见 [plan.MD](../../../plan.MD)。

@@ -105,6 +105,8 @@ class Config:
         cfg.setdefault("decimals", 18)
         cfg.setdefault("confirmations", 1)
         cfg.setdefault("fee_mode", "auto")
+        if cfg.get("wrapped_native_address"):
+            cfg["wrapped_native_address"]=address(cfg["wrapped_native_address"],field=f"chains.{name}.wrapped_native_address")
         require(cfg["fee_mode"] in ("auto", "legacy", "eip1559"), "Invalid fee mode", "CONFIG_ERROR")
         require(0 <= cfg["decimals"] <= 255 and cfg["confirmations"] >= 1, "Invalid chain settings", "CONFIG_ERROR")
         return cfg

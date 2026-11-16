@@ -96,7 +96,9 @@ class RPC:
                 url = client.provider.endpoint_uri
                 validation_key = (id(self), name)
                 if validation_key not in budget.validated_rpcs:
-                    response = json_request("POST", url, timeout=min(10, budget.spend("chain_validation")),
+                    timeout=min(10,budget.spend("chain_validation"))
+                    budget.record_rpc("eth_chainId")
+                    response = json_request("POST", url, timeout=timeout,
                                             payload={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
                     if response.get("error"):
                         last_code = optional_error_code(response["error"])
@@ -104,7 +106,9 @@ class RPC:
                     require(int(response.get("result", "0x0"), 16) == self.chain["chain_id"],
                             "Analysis RPC Chain ID mismatch", "CHAIN_ID_MISMATCH")
                     budget.validated_rpcs.add(validation_key)
-                response = json_request("POST", url, timeout=min(15, budget.spend()),
+                timeout=min(15,budget.spend())
+                budget.record_rpc(method)
+                response = json_request("POST", url, timeout=timeout,
                                         payload={"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
                 if response.get("error"):
                     last_code = optional_error_code(response["error"])
@@ -117,6 +121,47 @@ class RPC:
             except Exception:
                 last_code = "SOURCE_UNAVAILABLE"
         raise ToolError(last_code, "Optional RPC capability unavailable; base transaction data is preserved")
+
+    def optional_batch(self, calls, budget):
+        """At most 20 independent eth_call operations; no Multicall semantics."""
+        require(0 < len(calls) <= 20, "Read batch must contain 1..20 calls")
+        require(all(method == "eth_call" and isinstance(params,list) and len(params)==2 for method,params in calls),
+                "Only eth_call is allowed in metadata batches")
+        from .network import json_request
+        fallback_allowed=False
+        last_code="SOURCE_UNAVAILABLE"
+        for name, client in self.clients:
+            if (id(self),name) in budget.batch_disabled:
+                fallback_allowed=True;continue
+            try:
+                if (id(self),name) not in budget.validated_rpcs:
+                    self.optional_request("eth_blockNumber",[],budget,rpc_name=name)
+                timeout=min(15,budget.spend())
+                budget.record_rpc("eth_call",len(calls))
+                response = json_request("POST",client.provider.endpoint_uri,timeout=timeout,
+                    payload=[{"jsonrpc":"2.0","id":i,"method":method,"params":params} for i,(method,params) in enumerate(calls)])
+                require(isinstance(response,list) and len(response)==len(calls), "RPC batch unsupported", "CAPABILITY_UNAVAILABLE")
+                by_id = {row.get("id"):row for row in response if isinstance(row,dict)}
+                require(set(by_id)==set(range(len(calls))), "Invalid batch response IDs", "INVALID_RESPONSE")
+                return [{"error":optional_error_code(by_id[i]["error"])} if by_id[i].get("error") else
+                        {"result":by_id[i]["result"]} if by_id[i].get("result") is not None else {"error":"SOURCE_NOT_FOUND"}
+                        for i in range(len(calls))]
+            except ToolError as exc:
+                if exc.code == "ANALYSIS_LIMIT": raise
+                last_code=exc.code
+                if exc.code in ("CAPABILITY_UNAVAILABLE","INVALID_RESPONSE"):
+                    fallback_allowed=True;budget.batch_disabled.add((id(self),name))
+            except Exception:
+                last_code="INVALID_RESPONSE"
+        if not fallback_allowed: return [{"error":last_code} for _ in calls]
+        results = []
+        for method, params in calls:
+            try: results.append({"result":self.optional_request(method,params,budget)})
+            except ToolError as exc:
+                results.append({"error":exc.code})
+                if exc.code == "ANALYSIS_LIMIT":
+                    results.extend({"error":exc.code} for _ in range(len(calls)-len(results))); break
+        return results
 
     def health(self):
         rows = []

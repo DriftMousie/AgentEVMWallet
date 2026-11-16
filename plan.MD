@@ -19,6 +19,7 @@
 | 文件 | 能力 |
 |---|---|
 | `chain.py` | 链列表、RPC/数据源能力探测、Chain ID 验证、区块和费用查询 |
+| `address.py` | 浏览器普通交易历史、方向/目标过滤、游标分页和近期直接调用候选汇总 |
 | `wallet.py` | 钱包 ID/标签、观察钱包、地址校验、原生币与 ERC-20 余额及汇总 |
 | `token.py` | ERC-20 名称、符号、精度、供应量和单位转换 |
 | `transaction.py` | 详情、回执、状态、确认数、Nonce、Gas、解析、模板、加速、取消和同笔重播 |
@@ -157,7 +158,7 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 
 离线行为测试使用标准库 unittest，并兼容 pytest 收集。真实本地 EVM 使用 eth-tester/Py-EVM 和预编译简化协议夹具，无需在线编译。缺少本地 EVM 依赖时明确跳过，不算通过。
 
-- 12 个入口独立运行；CLI/JSON 行为一致，输出及退出码符合协议。
+- 13 个入口独立运行；CLI/JSON 行为一致，输出及退出码符合协议。
 - 标签歧义、缺失配置、地址不一致、观察钱包写入、敏感信息脱敏。
 - Chain ID 校验、RPC 故障切换、费用模式、精度与金额边界。
 - 默认预览不签名广播、显式执行、模拟失败及显式绕过。
@@ -173,7 +174,7 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 
 实施顺序：配置/协议 → RPC/只读 → ABI/交易解析/模板 → 交易引擎/转账/授权/NFT → 签名/事件/批量 → 测试和文档。
 
-交付 12 个入口文件、共享核心、依赖锁、配置模板、示例、中文 README、Hermes Skill、测试和本计划文件。
+交付 13 个入口文件、共享核心、依赖锁、配置模板、示例、中文 README、Hermes Skill、测试和本计划文件。
 
 首版支持本地 EOA、普通 EVM JSON-RPC。暂不包括 MCP、智能账户写入、合约部署、全量资产/授权索引、桥、交易市场、协议专用流程、常驻调度和持久化任务恢复。
 
@@ -214,3 +215,17 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 - 默认 max_requests=300，时间维持 60 秒；保留用户显式配置/CLI 覆盖。新增 requests_by_stage，计数包含增强阶段实际 HTTP 请求，不含基础 inspect。
 - 用户 BSC 单跳样本在 100/200/300/500 各档冷缓存为 34 次请求、热缓存 33 次，9/9 组历史余额完成；默认时限另测 7.24 秒。公共节点不支持两类 trace，因此不宣称全能力完成；细分数据和限制见 analysis.md。
 - 同步全部五份 Markdown，开发回归与真实交易材料仅保留临时目录。此次不包含 V3 packed path、Universal Router 或任意聚合器指令流解析。
+
+
+## 12. Agent 资金结论与复现工作流（九项）
+
+- 增加 fund_flows，默认 from，可指定 focus_address；ERC-20/NFT 独立解析标准日志，不依赖项目 ABI。原生币 trace 与 prestate 证据分开，退款未知为 null，费用范围明确，metadata 缺失不丢地址/原始数。
+- 新增 --view summary/full；默认 full，summary 的完整 CLI JSON 信封含换行 <=2048 UTF-8 字节，明确裁剪计数、风险和未知项，不带 inspection/calldata。
+- 新增 address.py history/actions，复用配置的 Blockscout/Etherscan，50 笔默认窗口、最多 200、过滤/游标/来源和完整性明确；不新增索引服务或无限扫块。
+- 增加 inferred_intent 及证据/置信度；资金流规则不替代确定函数含义，包装币按链配置地址识别，授权模式不混淆 ERC-20 与 NFT。
+- 部分结果 issues/data.suggested_next 与真正错误 error.suggested_next 提供结构化只读后续动作，不编造签名，不自动广播。
+- 日志地址/识别资产 metadata 去重预取，20 个 eth_call 一批，乱序按 ID 匹配，单项失败隔离；批量不支持回退、鉴权/限流不盲目展开请求。
+- transaction.plan 合并解析/内存模板/参数修改/模拟估费，标准受益人改为自己并列 diff；未知参数不猜改，证明/owner/deadline 不自动重写。永不接受 execute/skip_simulation，实时查询，不签名广播。
+- 扩展本地缓存为分析快照与按区块哈希隔离的 metadata；完整增强 300 秒、部分 60 秒，pending/重组不存快照；no-cache 强制刷新，plan 的当前状态不缓存。
+- analyze/plan/history/actions 增加静态 --describe，不依赖配置或网络。13 个入口、全部 Markdown 与 Skill 同步。gulltoppr 独立后续处理，未纳入本轮。
+- 实测缓存摘要 1398 字节并验证零网络，冷分析 34 HTTP/37 RPC。公共节点这次历史读取返回鉴权/权限拒绝且不支持 trace，公共历史 API 也返回鉴权错误，均如实返回，不宣称能力已完整；开发测试/真实交易材料不加入仓库。

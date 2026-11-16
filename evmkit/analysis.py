@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import re
+import hashlib
 from eth_abi import decode, encode
 from web3 import Web3
 
@@ -11,6 +12,7 @@ from .explorers import Sources
 from .network import Budget
 from .standards import entries, V2_ROUTER
 from .diagnostics import missing, combine
+from .cache import SnapshotCache, analysis_key
 
 ZERO = "0x" + "0"*40
 IMPLEMENTATION_SLOT = hex(int.from_bytes(Web3.keccak(text="eip1967.proxy.implementation"), "big")-1)
@@ -59,9 +61,10 @@ class Analyzer:
             if key in params:
                 require(isinstance(params[key], list), f"{key} must be a JSON array")
                 self.params[key] = [address(value, field=key) for value in params[key]]
+        if "focus_address" in params: self.params["focus_address"]=address(params["focus_address"],field="focus_address")
         self.options = settings(config, params)
         self.budget = Budget(self.options["time_budget_seconds"], self.options["max_requests"])
-        self.sources = Sources(config, chain, self.budget, self.options["external"], self.options["max_pages"])
+        self.sources = Sources(config, chain, self.budget, self.options["external"], self.options["max_pages"], params.get("no_cache",False))
         self.inspection = inspection
         self.block = "latest"
         if inspection:
@@ -69,6 +72,9 @@ class Analyzer:
             self.block = hex(int(tx["blockNumber"])) if tx.get("blockNumber") is not None else "pending"
         self.memo, self.issues, self.evidence = {}, [], {}
         self.enhancements_missing = []
+        self.persistent = SnapshotCache(config)
+        self.cache_scope = analysis_key(config,{"chain":chain["alias"]})
+        self.metadata_addresses = set()
 
     def issue(self, code, required=False):
         if required:
@@ -115,12 +121,47 @@ class Analyzer:
     def metadata(self, target):
         target = address(target)
         if ("metadata", target) in self.memo: return self.memo["metadata", target]
-        decimals = self.quiet_call(target, "decimals()", [], ["uint8"])
-        symbol = self.quiet_call(target, "symbol()", [], ["string"])
-        out = {"address": target, "decimals": decimals, "symbol": symbol[:128] if isinstance(symbol, str) else None,
-               "source": "rpc", "block": self.block, "status": "complete" if decimals is not None and symbol is not None else "partial"}
-        self.memo["metadata", target] = out
-        return out
+        self.prefetch_metadata([target])
+        return self.memo["metadata",target]
+
+    def prefetch_metadata(self, targets):
+        pending = []
+        block_hash = self.memo.get("block_hash")
+        if not block_hash and self.inspection and self.inspection.get("receipt"):
+            block_hash = ashex(self.inspection["receipt"]["blockHash"])
+        for target in dict.fromkeys(address(t) for t in targets):
+            self.metadata_addresses.add(target)
+            if ("metadata",target) in self.memo: continue
+            key = hashlib.sha256(json.dumps(["metadata-v1",self.cache_scope,target,self.block,block_hash]).encode()).hexdigest()
+            hit = self.persistent.get(key) if block_hash and not self.params.get("no_cache") else None
+            if hit: self.memo["metadata",target] = hit; continue
+            pending.append((target,key))
+        for offset in range(0,len(pending),10):
+            group = pending[offset:offset+10]
+            calls = [("eth_call",[{"to":target,"data":encode_call(signature,[])},self.block])
+                     for target,_ in group for signature in ("decimals()","symbol()")]
+            if hasattr(self.rpc,"optional_batch"):
+                rows = self.attempt(lambda:self.rpc.optional_batch(calls,self.budget),"TOKEN_METADATA") or [{} for _ in calls]
+            else:
+                rows = [{"result":self.attempt(lambda:self.query(method,params),"TOKEN_METADATA")} for method,params in calls]
+            for row in rows:
+                if row.get("error"): self.issue("TOKEN_METADATA:"+row["error"])
+            for i,(target,key) in enumerate(group):
+                decimals,symbol = None,None
+                try: decimals = decode(["uint8"],bytes.fromhex(ashex(rows[i*2]["result"])[2:]))[0]
+                except Exception: pass
+                try:
+                    raw = bytes.fromhex(ashex(rows[i*2+1]["result"])[2:])
+                    try: symbol = decode(["string"],raw)[0]
+                    except Exception:
+                        if len(raw)==32: symbol=raw.rstrip(b"\0").decode("utf-8")
+                    if not isinstance(symbol,str) or not symbol or not all(c.isprintable() for c in symbol): symbol=None
+                except Exception: pass
+                out={"address":target,"decimals":decimals,"symbol":symbol[:128] if symbol else None,
+                     "source":"rpc","block":self.block,"status":"complete" if decimals is not None and symbol else "partial"}
+                self.memo["metadata",target]=out
+                if out["status"]=="complete" and block_hash: self.persistent.put(key,out,3600)
+                if out["status"]!="complete": self.issue("TOKEN_METADATA_PARTIAL")
 
     def kind(self, target, vault=False):
         target = address(target)
@@ -566,11 +607,23 @@ class Analyzer:
         return {"type": business, "standard": kind, "confidence": decoded.get("confidence", "pattern"),
                 "evidence": evidence, "committed": committed}, risks
 
+    def approval_hint(self,decoded):
+        candidates=[decoded] if decoded.get("status")=="decoded" else decoded.get("candidates",[])
+        match=next((c for c in candidates if c.get("signature")=="approve(address,uint256)" and len(c.get("args",[]))==2),None)
+        if not match: return None
+        spender=self.counterpart(address(match["args"][0]))
+        if spender.get("is_contract") is not True or spender.get("is_verified") is not False: return None
+        return ({"value":"approval_like","confidence":"low","evidence":["approve_signature_pattern","spender_explicitly_unverified"],
+                 "scope":"ERC-20 allowance vs ERC-721 token approval is unresolved"},
+                {"code":"UNVERIFIED_SPENDER_CANDIDATE","severity":"info","address":spender["address"],
+                 "message":"Approval-like calldata targets an explicitly unverified spender; interface semantics remain unresolved",
+                 "identity":{k:spender.get(k) for k in ("is_contract","creator_address","creation_transaction_hash","has_transactions","verification_by_source")}})
+
     def subjects(self, transaction, events):
         result = []
         requested = self.params.get("addresses", [])
         require(isinstance(requested, list), "addresses must be a JSON array")
-        for candidate in [transaction.get("from"), transaction.get("to")]+requested:
+        for candidate in [transaction.get("from"), transaction.get("to"),self.params.get("focus_address")]+requested:
             if candidate and address(candidate) not in result: result.append(address(candidate))
         for event in events:
             args = (event.get("decoded") or {}).get("args") or {}
@@ -687,10 +740,14 @@ class Analyzer:
         self.budget.reserve_requests = min(2, max(0,self.options["max_requests"]-1))
         self.budget.phase = "input_decode"
         tx, receipt = self.inspection["transaction"], self.inspection["receipt"]
+        self.budget.phase="metadata"
+        self.prefetch_metadata([row["address"] for row in (receipt.get("logs",[]) if receipt else [])[:self.options["max_frames"]]])
+        self.budget.phase="input_decode"
         if self.params.get("abi") is not None or self.params.get("signature") is not None:
             decoded = self.decode_input(tx["data"], tx.get("to"), self.params.get("abi"), self.params.get("signature"))
         else:
             decoded = self.attempt(lambda: self.decode_input(tx["data"], tx.get("to")), "INPUT_DECODE", required=True) or {"status": "unknown", "candidates": []}
+        self.memo["root_decode"]=decoded
         self.budget.phase = "amounts"
         amounts = self.attempt(lambda: self.input_amounts(decoded, tx.get("to"), tx.get("value",0)), "INPUT_AMOUNTS") or []
         if int(tx.get("value", 0)) > 0 and not any(a["argument"] == "transaction.value" for a in amounts):
@@ -716,6 +773,10 @@ class Analyzer:
         if tx.get("to") and tx["data"] == "0x" and int(tx.get("value", 0))>0:
             classification = {"type": "native_value_call" if counterpart and counterpart.get("has_executable_code") else "native_transfer",
                               "evidence": ["empty input and native value"], "committed": bool(receipt["status"]) if receipt else None}
+        if classification.get("type") in ("unknown","contract_call"):
+            hint=self.attempt(lambda:self.approval_hint(decoded),"APPROVAL_HINT")
+            if hint:
+                classification["inferred_intent"]=hint[0];risks.append(hint[1])
         if counterpart:
             executed = list(dict.fromkeys(row["to"] for row in internals["calls"]
                             if row.get("type") == "DELEGATECALL" and row.get("execution_context") == tx.get("to") and len(row.get("path") or []) == 1))
@@ -758,16 +819,28 @@ class Analyzer:
                 self.issue("REQUIRED_CALL_TRACE_UNAVAILABLE", required=True)
             if changes.get("native_transaction_status") != "complete":
                 self.issue("REQUIRED_STATE_DIFF_UNAVAILABLE", required=True)
+        from .flows import fund_flows,infer_intent
+        flows=fund_flows(self,tx,receipt,internals,changes)
+        inferred=infer_intent(classification,flows,decoded,self.chain)
+        if inferred: classification["inferred_intent"]=inferred
         warnings, enhancements = self.diagnostics()
         if self.options["require_trace"]:
             enhancements = [e for e in enhancements if e["capability"] not in ("internal_calls", "native_state_diff")]
         complete = not warnings
-        return {"inspection": self.inspection, "input_decode": decoded, "amounts": amounts,
+        output = {"inspection": self.inspection, "input_decode": decoded, "amounts": amounts,
                 "decoded_events": events, "sender": sender, "counterpart": counterpart, "balance_changes": changes,
                 "internal_calls": internals, "classification": classification, "risks": risks,
                 "analysis_status": "complete" if complete else "partial", "warnings": warnings,
                 "analysis_profile": "strict_trace" if self.options["require_trace"] else "standard",
                 "core_status": {"input": "complete" if input_complete else "partial", "events": "complete" if events_complete else "partial"},
                 "enhancements_missing": enhancements,
+                "fund_flows":flows,
+                "token_metadata":[self.memo["metadata",target] for target in sorted(self.metadata_addresses) if ("metadata",target) in self.memo],
                 "capabilities": {"external_enabled": self.options["external"], "trace_enabled": self.options["trace"],
-                                 "requests_used": self.budget.requests, "requests_by_stage":dict(self.budget.by_stage)}}
+                                 "requests_used": self.budget.requests, "requests_by_stage":dict(self.budget.by_stage),
+                                 "rpc_calls":self.budget.rpc_calls,"rpc_calls_by_method":dict(self.budget.rpc_by_method)}}
+        from .agent_output import suggested_next
+        next_params={**self.params,"chain":self.chain["alias"],"hash":ashex(tx["hash"])}
+        output["suggested_next"]=suggested_next(next_params,output) if warnings else []
+        output["issues"]=[{"code":code,"suggested_next":output["suggested_next"]} for code in warnings]
+        return output
