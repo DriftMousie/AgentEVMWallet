@@ -21,11 +21,36 @@ def require(condition, message, code="INVALID_INPUT"):
         raise ToolError(code, message)
 
 
-def address(value):
-    require(isinstance(value, str) and Web3.is_address(value), "Invalid EVM address")
-    if value != value.lower() and value != value.upper():
-        require(Web3.is_checksum_address(value), "Invalid mixed-case address checksum")
-    return Web3.to_checksum_address(value)
+def address(value, field="address"):
+    def invalid(reason, message):
+        raise ToolError("INVALID_INPUT", f"{field}: {message}", data={"field": field, "reason": reason})
+    if not isinstance(value, str):
+        invalid("invalid_type", "EVM address must be a string")
+    body = value[2:] if value.startswith(("0x", "0X")) else value
+    if len(body) != 40:
+        invalid("invalid_length", f"Invalid EVM address length: expected 40 hex characters (42 with 0x prefix), got {len(value)} characters")
+    if re.fullmatch(r"[0-9a-fA-F]{40}", body) is None:
+        invalid("invalid_characters", "Invalid EVM address characters: use only hexadecimal 0-9, a-f after the optional 0x prefix")
+    normalized = "0x" + body
+    if body != body.lower() and body != body.upper() and not Web3.is_checksum_address(normalized):
+        invalid("invalid_checksum", "Invalid EVM address checksum: mixed-case addresses must match EIP-55; verify the source address")
+    return Web3.to_checksum_address(normalized)
+
+
+def wallet_selectors(value):
+    """Accept an array or comma-separated IDs/labels, without echoing input."""
+    if isinstance(value, str):
+        if value.lstrip().startswith("["):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                raise ToolError("INVALID_INPUT", 'wallets: invalid JSON array; use ["trading","treasury"] or trading,treasury') from None
+        else:
+            require(not value.lstrip().startswith("{"), "wallets must be a JSON array or comma-separated wallet IDs")
+            value = value.split(",")
+    require(isinstance(value, list) and all(isinstance(v, str) and v.strip() for v in value),
+            "wallets must contain non-empty wallet IDs or labels; use a JSON array or comma-separated values")
+    return [v.strip() for v in value]
 
 
 def uint(value, name="integer"):

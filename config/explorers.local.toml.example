@@ -1,0 +1,6 @@
+# Copy to explorers.local.toml and chmod 600. Do not add keys to .env.
+etherscan_api_key = ""
+
+# Optional provider credentials for the chosen chain:
+[chains.base]
+blockscout_api_key = ""

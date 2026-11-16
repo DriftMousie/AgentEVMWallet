@@ -9,7 +9,7 @@ from contextlib import contextmanager, nullcontext
 
 from web3 import Web3
 
-from .common import ToolError, require, uint, address, hexdata, txhash, jsonable
+from .common import ToolError, require, uint, address, hexdata, txhash, jsonable, formatted
 
 
 class Journal:
@@ -86,6 +86,17 @@ def fees(rpc, chain, params):
     return {"gasPrice": uint(gas_price, "gas price") if gas_price is not None else rpc.read(lambda w: w.eth.gas_price)}
 
 
+def fee_summary(transaction):
+    """Human/agent-facing rates; never pass this representation to the signer."""
+    names = ("gasPrice", "maxFeePerGas", "maxPriorityFeePerGas")
+    return {
+        "fee_model": "eip1559" if "maxFeePerGas" in transaction else "legacy",
+        "rate_unit": "per_gas",
+        "fees": {name: {"wei": str(uint(transaction[name])), "gwei": formatted(transaction[name], 9)}
+                 for name in names if name in transaction},
+    }
+
+
 def wait_receipt(rpc, hash_, confirmations=1, timeout=120):
     confirmations, timeout = uint(confirmations), uint(timeout)
     require(confirmations >= 1, "Confirmations must be at least one")
@@ -149,7 +160,7 @@ class Engine:
             unit_fee = tx.get("maxFeePerGas", tx.get("gasPrice"))
             balance = self.rpc.read(lambda w: w.eth.get_balance(sender, "pending"))
             require(balance >= value + gas * unit_fee, "Insufficient native balance for value and execution fee cap", "INSUFFICIENT_BALANCE")
-            preview = {"transaction": tx, "simulation": simulation, "execution_fee_cap_wei": str(gas * unit_fee),
+            preview = {"transaction": tx, "fee_summary": fee_summary(tx), "simulation": simulation, "execution_fee_cap_wei": str(gas * unit_fee),
                        "fee_scope": "EVM execution only; chain-specific L1/data fees are not included", "status": "preview"}
             if not execute:
                 return preview

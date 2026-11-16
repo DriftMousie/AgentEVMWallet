@@ -1,0 +1,33 @@
+# Optional public sources. Fill in a chain's Blockscout HTTP(S) origin to enable it.
+# Set etherscan=true only after configuring explorers.local.toml with chmod 600.
+[fourbyte]
+enabled = true
+base_url = "https://www.4byte.directory"
+
+[chains.ethereum]
+blockscout_url = ""
+etherscan = false
+
+[chains.base]
+blockscout_url = ""
+etherscan = false
+
+[chains.arbitrum]
+blockscout_url = ""
+etherscan = false
+
+[chains.optimism]
+blockscout_url = ""
+etherscan = false
+
+[chains.polygon]
+blockscout_url = ""
+etherscan = false
+
+[chains.bsc]
+blockscout_url = ""
+etherscan = false
+
+[chains.sepolia]
+blockscout_url = ""
+etherscan = false

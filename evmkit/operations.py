@@ -9,13 +9,14 @@ from eth_account import Account
 from eth_account.messages import encode_defunct, encode_typed_data
 from web3 import Web3
 
-from .abi import ERC20, NFT, canonical, coerce, decode_call, decode_revert, encode_call, load_abi, resolve, signature_parts
-from .common import ToolError, address, formatted, hexdata, jsonable, read_json, require, result, txhash, uint, units
-from .engine import Engine, Journal, fees, wait_receipt
+from .abi import ERC20, NFT, canonical, coerce, decode_call, decode_revert, encode_call, load_abi, read_abi, resolve, signature_parts
+from .common import ToolError, address, formatted, hexdata, jsonable, read_json, require, result, txhash, uint, units, wallet_selectors
+from .engine import Engine, Journal, fees, fee_summary, wait_receipt
 from .rpc import RPC
 
 WRITE = {"execute", "gas", "gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "skip_simulation", "reason", "wait", "timeout", "confirmations"}
 BASE = {"chain", "wallet"}
+ANALYSIS = {"external", "trace", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses"}
 # This registry drives both the Python API and the CLI, including unknown-field rejection.
 OPS = {
     "chain": {"list": set(), "health": {"chain"}, "block": {"chain", "block"}, "fees": {"chain"}},
@@ -25,8 +26,9 @@ OPS = {
     "transaction": {"inspect": {"chain", "hash"}, "status": {"chain", "hash"},
                     "nonce": BASE | {"address"}, "gas": {"chain"},
                     "wait": {"chain", "hash", "confirmations", "timeout"},
-                    "decode": {"chain", "hash", "abi", "signature"},
-                    "export-template": {"chain", "hash", "abi", "signature", "output"},
+                    "decode": {"chain", "hash", "abi", "signature"} | ANALYSIS,
+                    "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses"} | ANALYSIS,
+                    "export-template": {"chain", "hash", "abi", "signature", "output"} | ANALYSIS,
                     "accelerate": BASE | WRITE | {"hash"}, "cancel": BASE | WRITE | {"hash"},
                     "replay": BASE | {"hash", "execute", "wait", "confirmations", "timeout"}},
     "contract": {"functions": {"abi"}, "encode": {"abi", "function", "args"},
@@ -45,7 +47,7 @@ OPS = {
             "approve": BASE | WRITE | {"contract", "operator", "token_id", "all", "approved"},
             "revoke": BASE | WRITE | {"contract", "operator", "token_id", "all"},
             "mint": BASE | WRITE | {"contract", "abi", "function", "signature", "args", "value_wei"}},
-    "events": {"read": {"chain", "contract", "from_block", "to_block", "topics", "abi", "chunk_size", "include_unconfirmed"}},
+    "events": {"read": {"chain", "contract", "from_block", "to_block", "topics", "abi", "chunk_size", "include_unconfirmed"} | ANALYSIS},
     "raw": {"encode": {"signature", "args"}, "decode": {"data", "signature", "abi", "output_types"},
             "call": BASE | {"to", "data", "signature", "args", "value_wei", "address", "block", "output_types", "template"},
             "write": BASE | WRITE | {"to", "data", "signature", "args", "value_wei", "template"},
@@ -112,7 +114,7 @@ class Toolkit:
             require(module in OPS and operation in OPS[module], "Unknown operation")
             require(isinstance(params, dict), "params must be an object")
             require(not (set(params) - OPS[module][operation]), "Unknown operation parameters")
-            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed"):
+            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace"):
                 if key in params: require(isinstance(params[key], bool), f"{key} must be boolean")
             if params.get("chain"):
                 chain_id = self.config.chain(params["chain"])["chain_id"]
@@ -144,7 +146,7 @@ class Toolkit:
 
     def chain_fees(self, p):
         chain, rpc = self.rpc(p)
-        return {"fees": fees(rpc, chain, {}), "scope": "EVM execution; excludes chain-specific data fees"}
+        return {**fee_summary(fees(rpc, chain, {})), "scope": "EVM execution; excludes chain-specific data fees"}
 
     transaction_gas = chain_fees
 
@@ -152,7 +154,7 @@ class Toolkit:
         rows = []
         for ident in self.config.wallets:
             try: rows.append(self.config.public_wallet(self.config.wallet(ident)))
-            except ToolError as exc: rows.append({"id": ident, "error": exc.code})
+            except ToolError as exc: rows.append({"id": ident, "error": exc.code, "message": exc.message, "details": exc.data})
         return rows
 
     def wallet_validate(self, p):
@@ -177,9 +179,9 @@ class Toolkit:
                 "balance": formatted(amount, decimals) if decimals is not None else None}
 
     def wallet_balances(self, p):
-        wallets = p.get("wallets", list(self.config.wallets))
+        wallets = wallet_selectors(p.get("wallets", list(self.config.wallets)))
         tokens = p.get("tokens", [])
-        require(isinstance(wallets, list) and isinstance(tokens, list), "wallets and tokens must be arrays")
+        require(isinstance(tokens, list), "tokens must be a JSON array")
         rows = []
         for wallet in wallets:
             for token in [None] + tokens:
@@ -244,19 +246,35 @@ class Toolkit:
     def transaction_decode(self, p):
         inspected = self.transaction_inspect(p)
         data = inspected["transaction"]["data"]
+        from .analysis import Analyzer
+        chain, rpc = self.rpc(p)
+        analyzer = Analyzer(self.config, chain, rpc, p, inspected)
         try:
-            decoded = decode_call(data, p.get("signature"), load_abi(p["abi"]) if p.get("abi") is not None else None)
+            decoded = analyzer.decode_input(data, inspected["transaction"].get("to"), p.get("abi"), p.get("signature"))
         except ToolError as exc:
             raise ToolError(exc.code, exc.message, data={"data": data, "inspection": inspected}) from None
+        self.warnings.extend(analyzer.issues+analyzer.sources.warnings)
         return {"data": data, "decoded": decoded, "inspection": inspected}
+
+    def transaction_analyze(self, p):
+        from .analysis import Analyzer
+        inspected = self.transaction_inspect(p)
+        chain, rpc = self.rpc(p)
+        result_ = Analyzer(self.config, chain, rpc, p, inspected).run()
+        self.warnings.extend(result_["warnings"])
+        return result_
 
     def transaction_export_template(self, p):
         source = self.transaction_decode(p)
         tx = source["inspection"]["transaction"]
         require(tx.get("to"), "Contract creation cannot be exported as a call template")
+        decoded = source["decoded"]
+        if decoded.get("status") != "decoded" or not decoded.get("template_safe", False):
+            self.warnings.append("Unconfirmed or ambiguous signature: exporting raw calldata only; provide explicit ABI/signature for editable parameters")
+            decoded = {"status": "unknown", "selector": source["data"][:10] if len(source["data"])>=10 else None}
         template = {"schema_version": 1, "source": {"chain_id": self.config.chain(p["chain"])["chain_id"],
                     "hash": txhash(p["hash"]), "sender": tx["from"], "status": source["inspection"]["status"]},
-                    "to": address(tx["to"]), "value_wei": str(tx["value"]), "data": source["data"], "decoded": source["decoded"],
+                    "to": address(tx["to"]), "value_wei": str(tx["value"]), "data": source["data"], "decoded": decoded,
                     "warnings": ["Check recipient, deadline, wallet-bound signature/proof and current contract state before reuse"]}
         export_json(template, p.get("output"))
         return template
@@ -303,7 +321,7 @@ class Toolkit:
         return decode_call(p["data"], abi=load_abi(p["abi"]))
 
     def contract_call(self, p):
-        abi = load_abi(p["abi"])
+        abi = read_abi(p.get("abi"), p["function"])
         item = resolve(abi, p["function"])
         data = encode_call(canonical(item), p.get("args", []))
         require(item.get("stateMutability") == "payable" or uint(p.get("value_wei", "0")) == 0, "Nonpayable function cannot receive value")
@@ -550,18 +568,20 @@ class Toolkit:
                 logs[key] = dict(row)
             completed, start = stop, stop + 1
         ordered = sorted(logs.values(), key=lambda i: (i["blockNumber"], i["transactionIndex"], i["logIndex"]))
-        if p.get("abi") is not None:
-            abi = load_abi(p["abi"])
-            from web3._utils.events import get_event_data
-            from eth_utils import event_abi_to_log_topic
-            codec = Web3().codec
-            events = [i for i in abi if i.get("type") == "event" and not i.get("anonymous", False)]
-            for row in ordered:
-                candidates = [i for i in events if row["topics"] and event_abi_to_log_topic(i) == row["topics"][0]]
-                if len(candidates) == 1:
-                    try: row["decoded"] = dict(get_event_data(codec, candidates[0], row))
-                    except Exception: row["decode_error"] = "Event ABI mismatch"
-        return {"logs": ordered, "completed_through": completed, "complete": True}
+        from .analysis import Analyzer
+        analyzer = Analyzer(self.config, chain, rpc, p)
+        block_memos = {}
+        for index, row in enumerate(ordered):
+            if index >= analyzer.options["max_frames"]:
+                row["decoded"] = {"status": "unavailable", "reason": "Event enrichment limit"}
+                analyzer.issue("EVENTS_TRUNCATED")
+                continue
+            analyzer.block = hex(row["blockNumber"])
+            analyzer.memo = block_memos.setdefault(analyzer.block, {})
+            row["decoded"] = analyzer.attempt(lambda: analyzer.decode_event(row, p.get("abi")), "EVENT_DECODE") or {"status": "unknown", "event": None, "args": None}
+        self.warnings.extend(analyzer.issues+analyzer.sources.warnings)
+        return {"logs": ordered, "completed_through": completed, "complete": True,
+                "enrichment_status": "complete" if not analyzer.issues and not analyzer.sources.warnings and all(row["decoded"].get("status") == "decoded" for row in ordered) else "partial"}
 
     def batch_run(self, p):
         require((p.get("items") is None) != (p.get("file") is None), "Provide items or file")

@@ -70,6 +70,35 @@ class RPC:
         except Exception:
             raise ToolError("BROADCAST_UNKNOWN", "Broadcast outcome unknown; query the recorded hash before replaying", retryable=False) from None
 
+    def optional_request(self, method, params, budget):
+        """Bounded raw RPC for enrichment; never accepts write methods."""
+        allowed = {"eth_call", "eth_getCode", "eth_getBalance", "eth_getStorageAt",
+                   "eth_getBlockByNumber", "debug_traceTransaction"}
+        require(method in allowed, "Analysis RPC method is not read-only", "INVALID_INPUT")
+        from .network import json_request
+        last_code = "SOURCE_UNAVAILABLE"
+        for _, client in self.clients:
+            try:
+                url = client.provider.endpoint_uri
+                response = json_request("POST", url, timeout=min(10, budget.spend()),
+                                        payload={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
+                require(int(response.get("result", "0x0"), 16) == self.chain["chain_id"],
+                        "Analysis RPC Chain ID mismatch", "CHAIN_ID_MISMATCH")
+                response = json_request("POST", url, timeout=min(15, budget.spend()),
+                                        payload={"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
+                if response.get("error"):
+                    code = response["error"].get("code")
+                    last_code = "CAPABILITY_UNAVAILABLE" if code in (-32601, -32602) else "OPTIONAL_RPC_REJECTED"
+                    continue
+                require("result" in response and response["result"] is not None, "Optional RPC returned no result", "SOURCE_NOT_FOUND")
+                return response["result"]
+            except ToolError as exc:
+                if exc.code == "ANALYSIS_LIMIT": raise
+                last_code = exc.code
+            except Exception:
+                last_code = "SOURCE_UNAVAILABLE"
+        raise ToolError(last_code, "Optional RPC capability unavailable; base transaction data is preserved")
+
     def health(self):
         rows = []
         for name, w3 in self.clients:

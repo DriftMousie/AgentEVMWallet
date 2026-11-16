@@ -5,13 +5,13 @@ import argparse
 import json
 import sys
 
-from .common import ToolError, jsonable, result, require
+from .common import ToolError, jsonable, result, require, wallet_selectors
 from .config import Config
 from .operations import OPS, Toolkit
 
 JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types"}
-BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed"}
-NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size"}
+BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace"}
+NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses"}
 
 
 class ParseError(Exception): pass
@@ -21,6 +21,13 @@ class Parser(argparse.ArgumentParser):
     def error(self, message):
         # Do not echo user arguments: an accidental private-key argument must not leak.
         raise ParseError("Invalid CLI arguments; use --help")
+
+
+class WalletsAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if hasattr(namespace, self.dest):
+            raise ParseError("Specify --wallets (or its --wallet alias) only once")
+        setattr(namespace, self.dest, wallet_selectors(values))
 
 
 def runtime(parser):
@@ -37,6 +44,10 @@ def main(module, argv=None):
         runtime(sub)
         for field in sorted(fields):
             kwargs = {"default": argparse.SUPPRESS}
+            if field == "wallets":
+                sub.add_argument("--wallets", "--wallet", dest="wallets", action=WalletsAction,
+                                 default=argparse.SUPPRESS, help='Wallet IDs/labels: trading,treasury or JSON ["trading","treasury"]')
+                continue
             if field in BOOL_FIELDS:
                 kwargs["action"] = argparse.BooleanOptionalAction
             elif field in JSON_FIELDS:
@@ -44,6 +55,10 @@ def main(module, argv=None):
                 kwargs["help"] = "JSON array"
             elif field in NUM_FIELDS:
                 kwargs["type"] = int
+            elif field == "abi":
+                kwargs["help"] = "ABI JSON file or preset: erc20, erc721, erc1155, weth, erc4626; transaction decode also auto-detects"
+            elif field in {"gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei"}:
+                kwargs["help"] = "Integer wei per gas, NOT gwei (1 gwei = 1000000000 wei)"
             sub.add_argument("--" + field.replace("_", "-"), **kwargs)
     try:
         opts = vars(parser.parse_args(argv))
@@ -64,7 +79,8 @@ def main(module, argv=None):
             require(operation is None or operation == request["operation"], "Operation differs from JSON input")
             operation, opts = request["operation"], request["params"]
         require(operation is not None, "Provide a subcommand or --input-json")
-        config = Config(path=config_options.get("config"), env_file=config_options.get("env_file"), state_dir=config_options.get("state_dir"))
+        analysis_only = module == "events" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
+        config = Config(path=config_options.get("config"), env_file=config_options.get("env_file"), state_dir=config_options.get("state_dir"), load_wallets=not analysis_only)
         response = Toolkit(config).run(module, operation, opts)
     except (ParseError, ToolError) as exc:
         response = result(module, error={"code": getattr(exc, "code", "INVALID_INPUT"),

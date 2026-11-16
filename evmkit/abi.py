@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from eth_abi import encode, decode
 from eth_abi.grammar import parse
 from web3 import Web3
@@ -18,7 +19,16 @@ ERC20 = [method("name", outputs=["string"]), method("symbol", outputs=["string"]
          method("decimals", outputs=["uint8"]), method("totalSupply", outputs=["uint256"]),
          method("balanceOf", ["address"], ["uint256"]), method("allowance", ["address", "address"], ["uint256"]),
          method("transfer", ["address", "uint256"], ["bool"], "nonpayable"),
-         method("approve", ["address", "uint256"], ["bool"], "nonpayable")]
+         method("approve", ["address", "uint256"], ["bool"], "nonpayable"),
+         method("transferFrom", ["address", "address", "uint256"], ["bool"], "nonpayable"),
+         {"type": "event", "name": "Transfer", "anonymous": False, "inputs": [
+             {"name": "from", "type": "address", "indexed": True},
+             {"name": "to", "type": "address", "indexed": True},
+             {"name": "value", "type": "uint256", "indexed": False}]},
+         {"type": "event", "name": "Approval", "anonymous": False, "inputs": [
+             {"name": "owner", "type": "address", "indexed": True},
+             {"name": "spender", "type": "address", "indexed": True},
+             {"name": "value", "type": "uint256", "indexed": False}]}]
 NFT = [method("supportsInterface", ["bytes4"], ["bool"]), method("balanceOf", ["address"], ["uint256"]),
        method("balanceOf", ["address", "uint256"], ["uint256"]), method("ownerOf", ["uint256"], ["address"]),
        method("tokenURI", ["uint256"], ["string"]), method("uri", ["uint256"], ["string"]),
@@ -88,10 +98,25 @@ def canonical(item):
 
 
 def load_abi(value):
+    if isinstance(value, str) and value in ("erc20", "erc721", "erc1155", "weth", "erc4626"):
+        from .standards import preset
+        return preset(value)
     data = read_json(value) if isinstance(value, str) else value
     if isinstance(data, dict): data = data.get("abi")
     require(isinstance(data, list) and all(isinstance(i, dict) and "type" in i for i in data), "Invalid ABI")
     return data
+
+
+def read_abi(value, function):
+    """Only known ERC-20 reads can omit ABI; never infer an unknown interface."""
+    if value is not None:
+        return load_abi(value)
+    abi = [item for item in ERC20 if item.get("stateMutability") in ("view", "pure")]
+    try:
+        resolve(abi, function)
+    except ToolError:
+        raise ToolError("ABI_REQUIRED", "Without --abi only standard ERC-20 reads are supported; provide --abi erc20, a file or inline ABI for this function") from None
+    return deepcopy(abi)
 
 
 def resolve(abi, function):
