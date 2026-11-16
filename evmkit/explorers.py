@@ -9,16 +9,18 @@ import tomllib
 from contextlib import closing
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qsl
+from web3 import Web3
 
-from .common import ToolError, address, require
-from .network import json_request
+from .common import ToolError, address, require, uint
+from .network import json_request, provider_error_code
+from .diagnostics import missing, combine
 
 
 class Sources:
     def __init__(self, config, chain, budget, enabled=True, max_pages=10):
         self.config, self.chain, self.budget = config, chain, budget
         self.enabled, self.max_pages = enabled, max_pages
-        self.warnings, self.memo = [], {}
+        self.warnings, self.memo, self.enhancements_missing = [], {}, []
         settings = config.raw.get("explorers", {})
         path = Path(settings.get("config_file", "explorers.toml"))
         self.path = path if path.is_absolute() else config.path.parent / path
@@ -26,18 +28,20 @@ class Sources:
         if enabled and self.path.exists():
             try:
                 self.raw = tomllib.loads(self.path.read_text())
-                require(isinstance(self.raw.get("chains", {}), dict) and isinstance(self.raw.get("fourbyte", {}), dict), "Invalid explorer configuration", "CONFIG_ERROR")
+                require(isinstance(self.raw.get("chains", {}), dict) and isinstance(self.raw.get("fourbyte", {}), dict) and isinstance(self.raw.get("sourcify", {}), dict), "Invalid explorer configuration", "CONFIG_ERROR")
                 cfg = self.raw.get("fourbyte", {})
                 require(isinstance(cfg.get("enabled", False), bool) and isinstance(cfg.get("base_url", ""), str), "Invalid 4byte configuration", "CONFIG_ERROR")
+                require(isinstance(self.raw.get("sourcify", {}).get("base_url", ""), str), "Invalid Sourcify configuration", "CONFIG_ERROR")
             except (ValueError, OSError, ToolError):
                 self.warn("EXPLORER_CONFIG_INVALID"); self.raw = {}
         self.provider = self.raw.get("chains", {}).get(chain["alias"], {})
-        if not isinstance(self.provider, dict) or not isinstance(self.provider.get("etherscan", False), bool) or not isinstance(self.provider.get("blockscout_url", ""), str):
+        if not isinstance(self.provider, dict) or not isinstance(self.provider.get("etherscan", False), bool) or not isinstance(self.provider.get("sourcify", False), bool) or not isinstance(self.provider.get("blockscout_url", ""), str) or not isinstance(self.provider.get("sourcify_url", ""), str):
             self.warn("EXPLORER_CONFIG_INVALID"); self.provider = {}
         self.cache = config.state_dir / "analysis-cache.sqlite3"
 
     def warn(self, code):
         if code not in self.warnings: self.warnings.append(code)
+        self.enhancements_missing = combine(self.enhancements_missing, [missing(code)])
 
     def keys(self):
         if "keys" in self.memo: return self.memo["keys"]
@@ -76,8 +80,9 @@ class Sources:
         if api_key: query["apikey"] = api_key
         data = json_request("GET", url, params=query, timeout=min(10, self.budget.spend()))
         require(not api_key or api_key not in json.dumps(data), "Optional provider reflected credentials; response discarded", "SOURCE_UNAVAILABLE")
-        if isinstance(data, dict) and (data.get("status") == "0" or data.get("error")):
-            raise ToolError("SOURCE_UNAVAILABLE", "Optional provider returned an error; response not cached")
+        failure = provider_error_code(data)
+        if failure:
+            raise ToolError(failure, "Optional provider returned an error; response not cached")
         self.memo[key] = data
         try:
             with closing(sqlite3.connect(self.cache, timeout=2)) as db:
@@ -101,43 +106,101 @@ class Sources:
         require(data.get("status") == "1" and isinstance(data.get("result"), list) and data["result"], "Etherscan ABI/metadata unavailable", "SOURCE_UNAVAILABLE")
         return data["result"][0]
 
-    def contract(self, target, code_hash=None):
+    def sourcify(self, target, context=None):
+        require(self.enabled and self.provider.get("sourcify", False), "Sourcify not configured", "SOURCE_UNCONFIGURED")
+        base = self.provider.get("sourcify_url") or self.raw.get("sourcify", {}).get("base_url", "https://sourcify.dev/server")
+        data = self.cached_get(base, f"/v2/contract/{self.chain['chain_id']}/{address(target)}",
+                               {"fields": "abi,compilation.name,deployment.deployer,deployment.transactionHash,runtimeBytecode.onchainBytecode"}, context=context)
+        require(isinstance(data, dict) and str(data.get("chainId")) == str(self.chain["chain_id"]) and address(data.get("address")) == address(target),
+                "Sourcify record does not match chain/address", "SOURCE_UNAVAILABLE")
+        return data
+
+    def contract(self, target, code_hash=None, with_activity=False, include_abi=True):
         target = address(target)
-        key = ("contract", target, code_hash)
+        key = ("contract", target, code_hash, with_activity, include_abi)
         if key in self.memo: return self.memo[key]
-        out = {"abi": None, "contract_name": None, "is_verified": None, "is_proxy": None,
-               "implementations": [], "source": None, "metadata_scope": "current"}
+        out = {"abi": None, "contract_name": None, "is_verified": None, "is_proxy": None, "proxy_type": None,
+               "implementations": [], "implementation_names": {}, "source": None, "metadata_scope": "current",
+               "creator_address": None, "creation_transaction_hash": None, "has_transactions": None,
+               "transactions_count": None, "activity_scope": "explorer_indexed_normal_transactions",
+               "identity_sources": {}, "verification_by_source": {}}
         if not self.enabled: return out
         try:
             info = self.blockscout("/api/v2/addresses/" + target, context=code_hash)
-            out.update(contract_name=info.get("name"), is_verified=info.get("is_verified") if isinstance(info.get("is_verified"), bool) else None)
+            require(isinstance(info, dict), "Invalid Blockscout address record", "SOURCE_UNAVAILABLE")
+            out.update(contract_name=info.get("name"), proxy_type=info.get("proxy_type"))
+            verified = info.get("is_verified")
+            if isinstance(verified, bool): out["verification_by_source"]["blockscout"] = {"status": "verified" if verified else "unverified"}
             implementations = info.get("implementations") or []
-            out["implementations"] = [address(i["address"]) for i in implementations if isinstance(i, dict) and i.get("address")]
-            if out["implementations"]: out["is_proxy"] = True
+            for implementation in implementations:
+                if isinstance(implementation, dict) and implementation.get("address"):
+                    location = address(implementation["address"])
+                    out["implementations"].append(location)
+                    if implementation.get("name"): out["implementation_names"][location] = str(implementation["name"])[:256]
+            if out["implementations"] or out["proxy_type"]: out["is_proxy"] = True
+            creator = info.get("creator_address_hash")
+            if isinstance(creator, dict): creator = creator.get("hash")
+            if creator:
+                out["creator_address"] = address(creator); out["identity_sources"]["creator"] = "blockscout"
+            out["creation_transaction_hash"] = info.get("creation_transaction_hash")
             out["source"] = "blockscout"
         except ToolError as exc: self.warn("BLOCKSCOUT_METADATA_" + exc.code)
         except (ValueError, TypeError, AttributeError, KeyError): self.warn("BLOCKSCOUT_METADATA_INVALID_DATA")
-        try:
-            info = self.blockscout("/api/v2/smart-contracts/" + target, context=code_hash)
-            if isinstance(info.get("abi"), list):
-                out.update(abi=info["abi"], is_verified=True, source="blockscout")
-            out["contract_name"] = out["contract_name"] or info.get("name")
-        except ToolError as exc: self.warn("BLOCKSCOUT_ABI_" + exc.code)
-        except (ValueError, TypeError, AttributeError, KeyError): self.warn("BLOCKSCOUT_ABI_INVALID_DATA")
-        if out["abi"] is None:
+        if with_activity:
+            try:
+                count = uint(self.blockscout("/api/v2/addresses/"+target+"/counters").get("transactions_count"))
+                out.update(transactions_count=count, has_transactions=count>0)
+                out["identity_sources"]["activity"] = "blockscout"
+            except ToolError as exc: self.warn("BLOCKSCOUT_ACTIVITY_"+exc.code)
+            except (TypeError, AttributeError, ValueError): self.warn("BLOCKSCOUT_ACTIVITY_INVALID_DATA")
+        if include_abi:
+            try:
+                info = self.blockscout("/api/v2/smart-contracts/" + target, context=code_hash)
+                if isinstance(info.get("abi"), list):
+                    out.update(abi=info["abi"], source="blockscout")
+                    out["verification_by_source"]["blockscout"] = {"status": "verified"}
+                out["contract_name"] = out["contract_name"] or info.get("name")
+            except ToolError as exc: self.warn("BLOCKSCOUT_ABI_" + exc.code)
+            except (ValueError, TypeError, AttributeError, KeyError): self.warn("BLOCKSCOUT_ABI_INVALID_DATA")
+        if include_abi and self.provider.get("sourcify", False) and (out["abi"] is None or not out["creator_address"]):
+            try:
+                info = self.sourcify(target, context=code_hash)
+                runtime = info.get("runtimeMatch")
+                status = "verified" if runtime in ("match", "exact_match") else "creation_only" if info.get("creationMatch") in ("match", "exact_match") else "unknown"
+                bytecode = info.get("runtimeBytecode", {}).get("onchainBytecode")
+                if status == "verified" and code_hash and (not isinstance(bytecode, str) or Web3.to_hex(Web3.keccak(hexstr=bytecode)) != code_hash):
+                    status = "code_mismatch"
+                out["verification_by_source"]["sourcify"] = {"status": status, "runtime_match": runtime, "creation_match": info.get("creationMatch")}
+                if status == "verified" and isinstance(info.get("abi"), list) and out["abi"] is None:
+                    out.update(abi=info["abi"], source="sourcify")
+                out["contract_name"] = out["contract_name"] or info.get("compilation", {}).get("name")
+                out["source"] = out["source"] or "sourcify"
+                deployment = info.get("deployment") or {}
+                if not out["creator_address"] and deployment.get("deployer"):
+                    out["creator_address"] = address(deployment["deployer"]); out["identity_sources"]["creator"] = "sourcify"
+                out["creation_transaction_hash"] = out["creation_transaction_hash"] or deployment.get("transactionHash")
+                if status != "verified": self.warn("SOURCIFY_ABI_"+status.upper())
+            except ToolError as exc: self.warn("SOURCIFY_ABI_"+exc.code)
+            except (ValueError, TypeError, AttributeError, KeyError): self.warn("SOURCIFY_ABI_INVALID_DATA")
+        if include_abi and out["abi"] is None:
             try:
                 info = self.etherscan(target, context=code_hash)
+                out["source"] = out["source"] or "etherscan"
                 abi = info.get("ABI", "")
                 if abi == "Contract source code not verified":
-                    out["is_verified"] = False
+                    out["verification_by_source"]["etherscan"] = {"status": "unverified"}
                 else:
                     parsed = json.loads(abi)
                     require(isinstance(parsed, list), "Invalid verified ABI", "SOURCE_UNAVAILABLE")
-                    out.update(abi=parsed, is_verified=True, source="etherscan")
+                    out.update(abi=parsed, source="etherscan")
+                    out["verification_by_source"]["etherscan"] = {"status": "verified"}
                 out["contract_name"] = out["contract_name"] or info.get("ContractName") or None
                 if info.get("Proxy") in ("0", "1"): out["is_proxy"] = info["Proxy"] == "1"
                 if info.get("Implementation"): out["implementations"] = [address(info["Implementation"])]
-            except (ToolError, ValueError, TypeError, AttributeError, KeyError): self.warn("ETHERSCAN_ABI_UNAVAILABLE")
+            except ToolError as exc: self.warn("ETHERSCAN_ABI_"+exc.code)
+            except (ValueError, TypeError, AttributeError, KeyError): self.warn("ETHERSCAN_ABI_INVALID_DATA")
+        statuses = [v["status"] for v in out["verification_by_source"].values()]
+        out["is_verified"] = True if "verified" in statuses else False if "unverified" in statuses else None
         self.memo[key] = out
         return out
 

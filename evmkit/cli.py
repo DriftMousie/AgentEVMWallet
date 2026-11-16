@@ -10,7 +10,7 @@ from .config import Config
 from .operations import OPS, Toolkit
 
 JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types"}
-BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace"}
+BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer"}
 NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses"}
 
 
@@ -59,6 +59,8 @@ def main(module, argv=None):
                 kwargs["help"] = "ABI JSON file or preset: erc20, erc721, erc1155, weth, erc4626; transaction decode also auto-detects"
             elif field in {"gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei"}:
                 kwargs["help"] = "Integer wei per gas, NOT gwei (1 gwei = 1000000000 wei)"
+            if field == "require_trace": kwargs["help"] = "Require both callTracer and prestateTracer diff; optional source failures otherwise do not lower core status"
+            if field == "explorer": kwargs["help"] = "Probe configured explorer APIs too (read-only, consumes provider quota)"
             sub.add_argument("--" + field.replace("_", "-"), **kwargs)
     try:
         opts = vars(parser.parse_args(argv))
@@ -79,7 +81,7 @@ def main(module, argv=None):
             require(operation is None or operation == request["operation"], "Operation differs from JSON input")
             operation, opts = request["operation"], request["params"]
         require(operation is not None, "Provide a subcommand or --input-json")
-        analysis_only = module == "events" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
+        analysis_only = module == "events" or module == "chain" and operation == "probe" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
         config = Config(path=config_options.get("config"), env_file=config_options.get("env_file"), state_dir=config_options.get("state_dir"), load_wallets=not analysis_only)
         response = Toolkit(config).run(module, operation, opts)
     except (ParseError, ToolError) as exc:

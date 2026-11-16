@@ -38,7 +38,11 @@
 
 命令、接口和故障处理由 Agent 按 [Skill](skills/evm-wallet/SKILL.md) 中的参考文档读取。
 
-可选配置 `config/explorers.toml`，让 Agent 获取已验证 ABI、合约名称等补充信息；API Key 放本地 `config/explorers.local.toml`，不要放进 `.env`。
+可选配置 `config/explorers.toml`，通过 Blockscout、Sourcify、Etherscan 获取 ABI 和身份信息；BSC 默认开启 Sourcify。API Key 放本地 `config/explorers.local.toml`，不要放进 `.env`。
+
+需要完整内部调用和交易级原生币变化时，RPC 应支持 `debug_traceTransaction` 的 callTracer 与 prestateTracer diff；公共节点未必开放。可告诉 Agent：“请探测 BSC 的 RPC 和浏览器能力”，它会运行 `chain.py probe --chain bsc --explorer`。供应商权限和历史范围详见 Skill，不要求 `debug_traceCall` 才能分析历史交易。
+
+标准分析的 `complete` 表示核心输入与事件已解析；可选能力缺失另列 `enhancements_missing`。需要严格完整追踪时，让 Agent 使用 `--require-trace`。
 
 有疑问或建议可以添加我的联系方式
 微信：Firefly_bit

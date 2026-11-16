@@ -9,6 +9,19 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from .common import ToolError, require
 
 
+def optional_error_code(error):
+    """Classify internally; never expose provider messages containing credentials."""
+    code, message = error.get("code"), str(error.get("message", "")).lower()
+    if code == -32601: return "CAPABILITY_UNAVAILABLE"
+    if code in (401, 403) or any(s in message for s in ("unauthor", "forbidden", "api key", "access denied", "not allowed", "plan required")): return "SOURCE_UNAUTHORIZED"
+    if code in (-32005, 429) or any(s in message for s in ("rate limit", "too many requests")): return "SOURCE_RATE_LIMITED"
+    if any(s in message for s in ("timeout", "timed out", "deadline exceeded")): return "SOURCE_TIMEOUT"
+    if any(s in message for s in ("missing trie", "historical state", "state is not available", "pruned", "reexec", "header not found")): return "HISTORY_UNAVAILABLE"
+    if any(s in message for s in ("unknown tracer", "unsupported tracer", "tracer not found", "only support", "unrecognized tracer")) or code == -32602 and "tracer" in message:
+        return "CAPABILITY_UNAVAILABLE"
+    return "OPTIONAL_RPC_REJECTED"
+
+
 class RPC:
     """Retry reads only. A send is deliberately a single RPC attempt."""
     def __init__(self, config, chain):
@@ -70,25 +83,28 @@ class RPC:
         except Exception:
             raise ToolError("BROADCAST_UNKNOWN", "Broadcast outcome unknown; query the recorded hash before replaying", retryable=False) from None
 
-    def optional_request(self, method, params, budget):
+    def optional_request(self, method, params, budget, rpc_name=None):
         """Bounded raw RPC for enrichment; never accepts write methods."""
         allowed = {"eth_call", "eth_getCode", "eth_getBalance", "eth_getStorageAt",
-                   "eth_getBlockByNumber", "debug_traceTransaction"}
+                   "eth_getBlockByNumber", "eth_blockNumber", "debug_traceTransaction", "debug_traceCall"}
         require(method in allowed, "Analysis RPC method is not read-only", "INVALID_INPUT")
         from .network import json_request
         last_code = "SOURCE_UNAVAILABLE"
-        for _, client in self.clients:
+        for name, client in self.clients:
+            if rpc_name is not None and name != rpc_name: continue
             try:
                 url = client.provider.endpoint_uri
                 response = json_request("POST", url, timeout=min(10, budget.spend()),
                                         payload={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
+                if response.get("error"):
+                    last_code = optional_error_code(response["error"])
+                    continue
                 require(int(response.get("result", "0x0"), 16) == self.chain["chain_id"],
                         "Analysis RPC Chain ID mismatch", "CHAIN_ID_MISMATCH")
                 response = json_request("POST", url, timeout=min(15, budget.spend()),
                                         payload={"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
                 if response.get("error"):
-                    code = response["error"].get("code")
-                    last_code = "CAPABILITY_UNAVAILABLE" if code in (-32601, -32602) else "OPTIONAL_RPC_REJECTED"
+                    last_code = optional_error_code(response["error"])
                     continue
                 require("result" in response and response["result"] is not None, "Optional RPC returned no result", "SOURCE_NOT_FOUND")
                 return response["result"]

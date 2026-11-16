@@ -5,6 +5,15 @@ import requests
 from .common import ToolError, require
 
 
+def provider_error_code(data):
+    if not isinstance(data, dict) or not (data.get("status") == "0" or data.get("error")):
+        return None
+    message = str(data.get("error") or data.get("result") or data.get("message", "")).lower()
+    if any(t in message for t in ("rate limit", "too many requests", "quota")): return "SOURCE_RATE_LIMITED"
+    if any(t in message for t in ("api key", "unauthor", "forbidden", "not allowed")): return "SOURCE_UNAUTHORIZED"
+    return "SOURCE_UNAVAILABLE"
+
+
 class Budget:
     def __init__(self, seconds=60, requests_limit=100):
         self.deadline = time.monotonic() + seconds
@@ -33,6 +42,8 @@ def json_request(method, url, *, timeout=10, params=None, payload=None, max_byte
                 raise ToolError("SOURCE_RATE_LIMITED", "Optional data source rate limited", retryable=True)
             if response.status_code == 404:
                 raise ToolError("SOURCE_NOT_FOUND", "Optional data source has no record", retryable=True)
+            if response.status_code in (401, 403):
+                raise ToolError("SOURCE_UNAUTHORIZED", "Optional data source requires different credentials or permissions")
             require(response.status_code == 200, "Optional data source request failed", "SOURCE_UNAVAILABLE")
             parts, size = [], 0
             for chunk in response.iter_content(65536):
@@ -43,6 +54,8 @@ def json_request(method, url, *, timeout=10, params=None, payload=None, max_byte
             return json.loads(b"".join(parts))
     except ToolError:
         raise
+    except requests.exceptions.Timeout:
+        raise ToolError("SOURCE_TIMEOUT", "Optional data source timed out", retryable=True) from None
     except Exception:
         # Requests exceptions can include API keys, full URLs and response bodies.
         raise ToolError("SOURCE_UNAVAILABLE", "Optional data source unavailable or returned invalid JSON", retryable=True) from None

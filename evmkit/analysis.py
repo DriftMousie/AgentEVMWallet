@@ -10,6 +10,7 @@ from .common import ToolError, address, formatted, hexdata, jsonable, require, u
 from .explorers import Sources
 from .network import Budget
 from .standards import entries
+from .diagnostics import missing, combine
 
 ZERO = "0x" + "0"*40
 IMPLEMENTATION_SLOT = hex(int.from_bytes(Web3.keccak(text="eip1967.proxy.implementation"), "big")-1)
@@ -24,6 +25,15 @@ def signed_format(value, decimals):
     return ("-" if value < 0 else "") + formatted(abs(value), decimals)
 
 
+def text_input(data):
+    """Decode the whole payload, never just a printable four-byte prefix."""
+    try:
+        text = bytes.fromhex(data[2:]).decode("utf-8", errors="strict")
+    except (ValueError, UnicodeError): return None
+    if not text.strip() or not all(c.isprintable() or c in "\n\r\t\u200c\u200d" for c in text): return None
+    return {"text": text[:4096], "text_truncated": len(text)>4096, "text_length": len(text), "encoding": "utf-8"}
+
+
 def settings(config, params):
     defaults = {"time_budget_seconds": 60, "max_requests": 100, "max_frames": 1000,
                 "max_depth": 64, "max_pages": 10, "max_tokens": 20, "max_addresses": 20}
@@ -34,12 +44,21 @@ def settings(config, params):
     for key in ("external", "trace"):
         defaults[key] = params.get(key, raw.get(key, True))
         require(isinstance(defaults[key], bool), f"{key} must be boolean")
+    defaults["require_trace"] = params.get("require_trace", False)
+    require(isinstance(defaults["require_trace"], bool), "require_trace must be boolean")
+    if defaults["require_trace"]:
+        require(params.get("trace") is not False, "--require-trace cannot be combined with --no-trace")
+        defaults["trace"] = True
     return defaults
 
 
 class Analyzer:
     def __init__(self, config, chain, rpc, params, inspection=None):
-        self.config, self.chain, self.rpc, self.params = config, chain, rpc, params
+        self.config, self.chain, self.rpc, self.params = config, chain, rpc, dict(params)
+        for key in ("addresses", "tokens"):
+            if key in params:
+                require(isinstance(params[key], list), f"{key} must be a JSON array")
+                self.params[key] = [address(value, field=key) for value in params[key]]
         self.options = settings(config, params)
         self.budget = Budget(self.options["time_budget_seconds"], self.options["max_requests"])
         self.sources = Sources(config, chain, self.budget, self.options["external"], self.options["max_pages"])
@@ -49,17 +68,25 @@ class Analyzer:
             tx = inspection["transaction"]
             self.block = hex(int(tx["blockNumber"])) if tx.get("blockNumber") is not None else "pending"
         self.memo, self.issues, self.evidence = {}, [], {}
+        self.enhancements_missing = []
 
-    def issue(self, code):
-        if code not in self.issues: self.issues.append(code)
+    def issue(self, code, required=False):
+        if required:
+            if code not in self.issues: self.issues.append(code)
+        else:
+            self.enhancements_missing = combine(self.enhancements_missing, [missing(code)])
+
+    def diagnostics(self):
+        optional = getattr(self.sources, "enhancements_missing", [])
+        return list(self.issues), combine(self.enhancements_missing, optional)
 
     def query(self, method, params):
         return self.rpc.optional_request(method, params, self.budget)
 
-    def attempt(self, fn, code):
+    def attempt(self, fn, code, required=False):
         try: return fn()
-        except ToolError as exc: self.issue(code+":"+exc.code)
-        except Exception: self.issue(code+":INVALID_SOURCE_DATA")
+        except ToolError as exc: self.issue(code+":"+exc.code, required)
+        except Exception: self.issue(code+":INVALID_SOURCE_DATA", required)
         return None
 
     def call(self, target, signature, args, outputs, block=None):
@@ -195,8 +222,8 @@ class Analyzer:
             if len(names) != len(set(names)): names = [f"arg{j}" for j in range(len(out["args"]))]
             out.update(named_args=dict(zip(names, out["args"])), source="explicit", confidence="user_supplied", template_safe=True)
             return out
-        if len(data) < 10:
-            return {"status": "unknown", "selector": None, "source": "none", "candidates": []}
+        if data == "0x":
+            return {"status": "empty", "input_kind": "empty", "selector": None, "source": "none", "candidates": []}
         builtin = self.candidates(data, entries("function"))
         if builtin:
             if target:
@@ -207,6 +234,16 @@ class Analyzer:
             else: kind = None
             if len(builtin) == 1:
                 return {**builtin[0], "confidence": "interface_evidence" if kind else "standard_pattern", "template_safe": kind is not None}
+        text = text_input(data)
+        if target and int(address(target), 16) > 0x11:
+            code = self.attempt(lambda: self.code(context or target), "INPUT_ACCOUNT_CODE")
+            if code == "0x" and not builtin:
+                return {"status": "onchain_message" if text else "data_only", "input_kind": "utf8_text" if text else "binary_data",
+                        "source": "rpc_code_and_input", "confidence": "block_end_eoa", "is_function_call": False,
+                        "candidates": [], "template_safe": False, **(text or {})}
+        if len(data) < 10:
+            return {"status": "unknown", "selector": None, "source": "none", "candidates": [],
+                    "input_kind": "utf8_text_candidate" if text else "opaque_data", **(text or {})}
         verified_records = []
         if target and self.options["external"]:
             for record in self.verified_abis(target):
@@ -229,7 +266,8 @@ class Analyzer:
             candidates.append(item)
         return {"status": "ambiguous" if len(candidates)>1 else "candidate" if candidates else "unknown",
                 "selector": data[:10], "source": "4byte" if candidates else "none", "candidates": candidates,
-                "complete": lookup["complete"], "template_safe": False}
+                "complete": lookup["complete"], "template_safe": False,
+                "input_kind": "utf8_text_candidate" if text else "opaque_data", **(text or {})}
 
     def amount(self, raw, target=None, argument=None, native=False):
         raw = uint(raw)
@@ -322,25 +360,47 @@ class Analyzer:
         if target is None:
             return {"address": None, "status": "not_applicable", "name": None, "is_verified": None, "is_proxy": None, "implementation": None}
         target = address(target)
-        info = self.sources.contract(target)
-        impl = self.attempt(lambda: self.implementation(target), "COUNTERPART_PROXY")
-        token_name = self.quiet_call(target, "name()", [], ["string"])
+        if ("identity", target) in self.memo: return self.memo["identity", target]
         code = self.attempt(lambda: self.code(target), "COUNTERPART_CODE")
-        return {"address": target, "name": token_name[:256] if isinstance(token_name, str) else info["contract_name"],
-                "contract_name": info["contract_name"], "is_verified": info["is_verified"],
-                "is_contract": code != "0x" if code is not None else None,
-                "is_proxy": True if impl and impl["address"] else info["is_proxy"],
+        impl = self.attempt(lambda: self.implementation(target), "COUNTERPART_PROXY")
+        info = self.sources.contract(target, with_activity=True, include_abi=code != "0x")
+        if code is None and (not impl or not impl["address"]) and len(info.get("implementations", [])) == 1:
+            impl = {"address": info["implementations"][0], "type": info.get("proxy_type"), "scope": "current_explorer"}
+        token_name = self.quiet_call(target, "name()", [], ["string"]) if code and code != "0x" else None
+        kind = "unknown" if code is None else "eoa" if code == "0x" else "delegated_eoa" if impl and impl["type"] == "eip7702" else "contract"
+        if code is None and info.get("proxy_type") == "eip7702": kind = "delegated_eoa"
+        implementation_name = info.get("implementation_names", {}).get(impl["address"]) if impl else None
+        if impl and impl["address"] and implementation_name is None:
+            implementation_info = self.sources.contract(impl["address"])
+            implementation_name = implementation_info.get("contract_name")
+        out = {"address": target, "name": token_name[:256] if isinstance(token_name, str) else info.get("contract_name"),
+                "contract_name": info.get("contract_name"), "is_verified": info.get("is_verified"),
+                "account_type": kind, "is_contract": None if kind == "unknown" else kind == "contract",
+                "has_executable_code": code != "0x" if code is not None else None,
+                "is_proxy": True if impl and impl["address"] else False if code == "0x" else info.get("is_proxy"),
+                "proxy_type": impl["type"] if impl and impl["address"] else info.get("proxy_type") if code is None or code != "0x" else None,
                 "implementation": impl["address"] if impl else None,
+                "implementation_name": implementation_name,
                 "implementation_type": impl["type"] if impl else None,
                 "implementation_scope": impl["scope"] if impl else "unknown",
-                "current_explorer_implementations": info["implementations"],
-                "source": {"name": "rpc" if token_name is not None else info["source"], "verification": info["source"]},
+                "current_explorer_proxy_type": info.get("proxy_type"),
+                "current_explorer_implementations": info.get("implementations", []),
+                "creator_address": info.get("creator_address"), "creation_transaction_hash": info.get("creation_transaction_hash"),
+                "has_transactions": info.get("has_transactions"), "transactions_count": info.get("transactions_count"),
+                "activity_scope": info.get("activity_scope"), "identity_sources": info.get("identity_sources", {}),
+                "verification_by_source": info.get("verification_by_source", {}),
+                "source": {"name": "rpc" if token_name is not None else info.get("source"), "verification": info.get("source")},
                 "block": self.block, "verification_scope": "current_explorer_record"}
+        self.memo["identity", target] = out
+        return out
 
     def internal_calls(self, hash_):
         if not self.options["trace"]:
             return {"status": "disabled", "source": None, "complete": False, "calls": []}
-        trace = self.attempt(lambda: self.query("debug_traceTransaction", [hash_, {"tracer": "callTracer", "timeout": "15s"}]), "CALL_TRACE")
+        trace = self.attempt(lambda: self.query("debug_traceTransaction", [hash_, {"tracer": "callTracer", "timeout": "10s"}]), "CALL_TRACE")
+        if trace is not None and (not isinstance(trace, dict) or not isinstance(trace.get("type"), str)):
+            self.issue("CALL_TRACE:INVALID_SOURCE_DATA")
+            trace = None
         rows, complete = [], True
         if isinstance(trace, dict):
             receipt_failed = bool(self.inspection and self.inspection.get("receipt") and self.inspection["receipt"]["status"] == 0)
@@ -357,7 +417,8 @@ class Analyzer:
                         "execution_context": execution_context, "value_wei": str(int(frame.get("value") or "0x0", 16)),
                         "input": frame.get("input", "0x"), "output": frame.get("output", "0x"),
                         "error": str(frame["error"])[:256] if frame.get("error") else None,
-                        "committed": not failed, "is_value_transfer": not failed and calltype in ("CALL", "CREATE", "CREATE2", "SELFDESTRUCT")}
+                        "committed": not failed, "may_carry_value": calltype in ("CALL", "CREATE", "CREATE2", "SELFDESTRUCT")}
+                item["is_value_transfer"] = item["may_carry_value"] and not failed and int(item["value_wei"]) > 0
                 decoded = self.attempt(lambda: self.decode_input(item["input"], target, context=execution_context), "INTERNAL_DECODE")
                 item["decoded"] = decoded
                 rows.append(item)
@@ -376,6 +437,11 @@ class Analyzer:
                    "value_wei": str(raw.get("value", "0")), "index": raw.get("index"),
                    "input": raw.get("input"), "error": raw.get("error"), "committed": None,
                    "decoded": None, "path": None}
+            calltype = str(row.get("call_type") or row.get("type") or "").upper()
+            row["may_carry_value"] = calltype in ("CALL", "CREATE", "CREATE2", "SELFDESTRUCT")
+            row["committed"] = False if row["error"] else None
+            value = int(row["value_wei"], 16 if row["value_wei"].startswith("0x") else 10)
+            row["is_value_transfer"] = False if not row["may_carry_value"] or value == 0 or row["error"] else None
             if row["input"]:
                 row["decoded"] = self.attempt(lambda: self.decode_input(row["input"], row["to"]), "INTERNAL_DECODE")
             rows.append(row)
@@ -384,6 +450,8 @@ class Analyzer:
                 "limitations": ["Explorer summary may omit calldata, reverted frames, delegatecalls or call hierarchy"]}
 
     def classify(self, decoded, target, committed=None):
+        if decoded and decoded.get("status") in ("onchain_message", "data_only"):
+            return {"type": decoded["status"], "evidence": ["no executable code at target block", "whole input inspected"], "confidence": decoded.get("confidence"), "committed": committed}, []
         if not decoded or decoded.get("status") != "decoded":
             return {"type": "unknown", "evidence": [], "committed": committed}, []
         signature = decoded["signature"]
@@ -399,12 +467,12 @@ class Analyzer:
             if value == 2**256-1:
                 risks.append({"code": "UNLIMITED_APPROVAL", "severity": "warning", "message": "ERC-20 allowance is uint256 maximum", "evidence": signature})
             if value > 0:
-                spender = address(args[0]); spender_code = self.attempt(lambda: self.code(spender), "SPENDER_CODE")
-                info = self.sources.contract(spender)
-                if spender_code and spender_code != "0x" and info["is_verified"] is False:
-                    risks.append({"code": "UNVERIFIED_SPENDER", "severity": "warning", "message": "Approval spender is a contract explicitly reported unverified", "address": spender})
-                elif spender_code and spender_code != "0x" and info["is_verified"] is None:
-                    risks.append({"code": "SPENDER_VERIFICATION_UNKNOWN", "severity": "info", "message": "Spender verification could not be determined", "address": spender})
+                spender = address(args[0]); info = self.counterpart(spender)
+                identity = {k: info.get(k) for k in ("address", "account_type", "is_contract", "has_executable_code", "creator_address", "creation_transaction_hash", "has_transactions", "transactions_count", "activity_scope", "identity_sources", "verification_by_source")}
+                if info["is_contract"] is True and info["is_verified"] is False:
+                    risks.append({"code": "UNVERIFIED_SPENDER", "severity": "warning", "message": "Approval spender is a contract explicitly reported unverified", "address": spender, "identity": identity})
+                elif info["has_executable_code"] and info["is_verified"] is None:
+                    risks.append({"code": "SPENDER_VERIFICATION_UNKNOWN", "severity": "info", "message": "Spender verification could not be determined", "address": spender, "identity": identity})
         elif kind in ("erc721", "erc1155"):
             business = "nft_transfer" if "Transfer" in name or name == "transferFrom" else "nft_approval" if name in ("approve", "setApprovalForAll") else "nft_call"
             if name == "setApprovalForAll" and args[1] is True:
@@ -451,8 +519,11 @@ class Analyzer:
                     tokens.append(address(annotation["token_address"]))
         native_status = "disabled" if not self.options["trace"] else "unavailable"
         if self.options["trace"]:
-            difference = self.attempt(lambda: self.query("debug_traceTransaction", [ashex(transaction["hash"]),
-                    {"tracer": "prestateTracer", "tracerConfig": {"diffMode": True, "disableCode": True, "disableStorage": True}, "timeout": "15s"}]), "STATE_DIFF")
+            if "required_state_diff" in self.memo:
+                difference = self.memo["required_state_diff"]
+            else:
+                difference = self.attempt(lambda: self.query("debug_traceTransaction", [ashex(transaction["hash"]),
+                        {"tracer": "prestateTracer", "tracerConfig": {"diffMode": True, "disableCode": True, "disableStorage": True}, "timeout": "10s"}]), "STATE_DIFF")
             if isinstance(difference, dict) and isinstance(difference.get("pre"), dict) and isinstance(difference.get("post"), dict):
                 before = {address(k): v for k, v in difference["pre"].items()}
                 after = {address(k): v for k, v in difference["post"].items()}
@@ -469,6 +540,8 @@ class Analyzer:
                                    "delta": signed_format(delta, self.chain["decimals"]), "symbol": self.chain.get("symbol"),
                                    "scope": "transaction", "source": "rpc.prestateTracer", "includes_transaction_fees": True})
                 native_status = "complete"
+            elif difference is not None:
+                self.issue("STATE_DIFF:INVALID_SOURCE_DATA")
         if receipt["status"] == 1:
             for event in events:
                 decoded = event["decoded"]
@@ -521,23 +594,27 @@ class Analyzer:
         if self.params.get("abi") is not None or self.params.get("signature") is not None:
             decoded = self.decode_input(tx["data"], tx.get("to"), self.params.get("abi"), self.params.get("signature"))
         else:
-            decoded = self.attempt(lambda: self.decode_input(tx["data"], tx.get("to")), "INPUT_DECODE") or {"status": "unknown", "candidates": []}
+            decoded = self.attempt(lambda: self.decode_input(tx["data"], tx.get("to")), "INPUT_DECODE", required=True) or {"status": "unknown", "candidates": []}
         amounts = self.attempt(lambda: self.input_amounts(decoded, tx.get("to")), "INPUT_AMOUNTS") or []
         if int(tx.get("value", 0)) > 0: amounts.append(self.amount(tx["value"], native=True, argument="transaction.value"))
         events = []
         raw_logs = receipt.get("logs", []) if receipt else []
         for log in raw_logs[:self.options["max_frames"]]:
             provided = self.params.get("abi") if tx.get("to") and address(log["address"]) == address(tx["to"]) else None
-            event = self.attempt(lambda: self.decode_event(log, provided), "EVENT_DECODE")
+            event = self.attempt(lambda: self.decode_event(log, provided), "EVENT_DECODE", required=True)
             events.append({"address": log["address"], "log_index": log.get("logIndex"),
                            "decoded": event or {"status": "unknown", "event": None, "args": None}})
-        if len(raw_logs)>len(events): self.issue("EVENTS_TRUNCATED")
+        if len(raw_logs)>len(events): self.issue("EVENTS_TRUNCATED", required=True)
+        if self.options["require_trace"] and receipt:
+            self.memo["required_state_diff"] = self.attempt(lambda: self.query("debug_traceTransaction", [ashex(tx["hash"]),
+                    {"tracer":"prestateTracer", "tracerConfig":{"diffMode":True,"disableCode":True,"disableStorage":True}, "timeout":"10s"}]), "STATE_DIFF")
+        internals = (self.attempt(lambda: self.internal_calls(ashex(tx["hash"])), "INTERNAL_CALLS") or {"status": "unavailable", "complete": False, "calls": []}) if receipt else {"status": "not_applicable", "complete": False, "calls": []}
+        sender = self.attempt(lambda: self.counterpart(tx.get("from")), "SENDER")
         counterpart = self.attempt(lambda: self.counterpart(tx.get("to")), "COUNTERPART")
         classification, risks = self.attempt(lambda: self.classify(decoded, tx.get("to"), bool(receipt["status"]) if receipt else None), "CLASSIFICATION") or ({"type": "unknown"}, [])
         if tx.get("to") and tx["data"] == "0x" and int(tx.get("value", 0))>0:
-            classification = {"type": "native_value_call" if counterpart and counterpart.get("is_contract") else "native_transfer",
+            classification = {"type": "native_value_call" if counterpart and counterpart.get("has_executable_code") else "native_transfer",
                               "evidence": ["empty input and native value"], "committed": bool(receipt["status"]) if receipt else None}
-        internals = (self.attempt(lambda: self.internal_calls(ashex(tx["hash"])), "INTERNAL_CALLS") or {"status": "unavailable", "complete": False, "calls": []}) if receipt else {"status": "not_applicable", "complete": False, "calls": []}
         if counterpart:
             executed = list(dict.fromkeys(row["to"] for row in internals["calls"]
                             if row.get("type") == "DELEGATECALL" and row.get("execution_context") == tx.get("to") and len(row.get("path") or []) == 1))
@@ -559,19 +636,33 @@ class Analyzer:
             canonical_block = self.attempt(lambda: self.query("eth_getBlockByNumber", [hex(int(receipt["blockNumber"])), False]), "CANONICAL_BLOCK_CHECK")
             if canonical_block and ashex(canonical_block["hash"]) != ashex(receipt["blockHash"]):
                 changes = {"status": "unavailable", "reason": "Chain reorganization detected"}
-                self.issue("REORG_DETECTED")
+                self.issue("REORG_DETECTED", required=True)
             elif canonical_block:
                 changes["canonicality"] = "verified"
             else:
                 changes["canonicality"] = "unverified"
                 changes["status"] = "partial" if changes.get("status") == "complete" else changes.get("status", "unavailable")
-        warnings = list(dict.fromkeys(self.issues+self.sources.warnings))
-        complete = (not warnings and decoded.get("status") == "decoded" and changes.get("status") == "complete"
-                    and internals.get("complete", False) and counterpart is not None
-                    and all(event["decoded"].get("status") == "decoded" for event in events))
+        input_complete = decoded.get("status") in ("decoded", "onchain_message", "data_only", "empty")
+        events_complete = len(raw_logs) == len(events) and all(event["decoded"].get("status") == "decoded" for event in events)
+        if not input_complete: self.issue("INPUT_UNRESOLVED", required=True)
+        if not events_complete: self.issue("EVENTS_UNRESOLVED", required=True)
+        if self.inspection["status"] == "reorged": self.issue("REORG_DETECTED", required=True)
+        if tx.get("blockNumber") is not None and receipt is None: self.issue("RECEIPT_UNAVAILABLE", required=True)
+        if self.options["require_trace"]:
+            if internals.get("source") != "rpc.callTracer" or not internals.get("complete"):
+                self.issue("REQUIRED_CALL_TRACE_UNAVAILABLE", required=True)
+            if changes.get("native_transaction_status") != "complete":
+                self.issue("REQUIRED_STATE_DIFF_UNAVAILABLE", required=True)
+        warnings, enhancements = self.diagnostics()
+        if self.options["require_trace"]:
+            enhancements = [e for e in enhancements if e["capability"] not in ("internal_calls", "native_state_diff")]
+        complete = not warnings
         return {"inspection": self.inspection, "input_decode": decoded, "amounts": amounts,
-                "decoded_events": events, "counterpart": counterpart, "balance_changes": changes,
+                "decoded_events": events, "sender": sender, "counterpart": counterpart, "balance_changes": changes,
                 "internal_calls": internals, "classification": classification, "risks": risks,
                 "analysis_status": "complete" if complete else "partial", "warnings": warnings,
+                "analysis_profile": "strict_trace" if self.options["require_trace"] else "standard",
+                "core_status": {"input": "complete" if input_complete else "partial", "events": "complete" if events_complete else "partial"},
+                "enhancements_missing": enhancements,
                 "capabilities": {"external_enabled": self.options["external"], "trace_enabled": self.options["trace"],
                                  "requests_used": self.budget.requests}}

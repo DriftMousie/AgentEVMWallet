@@ -61,13 +61,13 @@ TOML 的 `[rpc] csv_file = "rpc.csv"` 指定 CSV 路径，相对路径以 TOML �
 
 ## 自动分析入口
 
-`transaction.py decode` 现在自动识别标准 selector，并按配置补充已验证 ABI/4byte 候选。完整分析使用 `transaction.py analyze --chain … --hash …`；`inspect` 保持基础查询。事件日志也可自动解码标准布局。数据源配置、历史精度、风险和调用树的完整性说明见 [自动分析参考](analysis.md)。
+`transaction.py decode` 现在自动识别标准 selector，并按配置补充已验证 ABI/4byte 候选。完整分析使用 `transaction.py analyze --chain … --hash …`；加 `--require-trace` 要求 callTracer 与 prestate diff 都完整成功；`inspect` 保持基础查询。事件日志也可自动解码标准布局。标准分析将核心失败放入 warnings，将可选源缺失放入 data.enhancements_missing；complete 不等于所有增强成功。身份同时包含 sender 和 counterpart（含 7702），支持全文 UTF-8 留言识别。已验证 ABI 按 Blockscout → Sourcify → Etherscan 顺序补充，4byte 最后兜底。数据源配置、历史精度、风险和调用树的完整性说明见 [自动分析参考](analysis.md)。
 
 ## 模块与调用
 
 | 文件 | 子命令 |
 |---|---|
-| `chain.py` | `list`、`health`、`block`、`fees` |
+| `chain.py` | `list`、`health`、`probe`、`block`、`fees` |
 | `wallet.py` | `list`、`validate`、`balance`、`balances` |
 | `token.py` | `info`、`convert` |
 | `transaction.py` | `inspect`、`status`、`nonce`、`gas`、`wait`、`decode`、`analyze`、`export-template`、`accelerate`、`cancel`、`replay` |
@@ -85,6 +85,8 @@ TOML 的 `[rpc] csv_file = "rpc.csv"` 指定 CSV 路径，相对路径以 TOML �
 ```bash
 # 检查 RPC，查询余额
 python chain.py health --chain base
+python chain.py probe --chain bsc --explorer
+# 可用 --hash 指定要检测历史 trace 的真实交易
 python wallet.py balance --chain base --wallet treasury
 python wallet.py balances --chain base --wallets '["treasury","trading"]' --tokens '[]'
 # 同样支持逗号分隔；仅 balances 子命令中的 --wallet 是 --wallets 别名
@@ -272,5 +274,7 @@ python batch.py run --file examples/batch.json --execute
 ## 发布范围
 
 发布目录仅包含运行代码、配置模板、用法示例和 Agent 文档，不附带开发测试代码、夹具或测试指南。
+
+`chain probe` 是有预算的只读实时探测，不缓存可用性，不签名、不广播、不加载私钥；即使没有启用的 RPC 也可探测已配置的数据源。CSV 仍严格使用五列；`bsc` 的 trace/archive 提示行默认禁用，须填写自己有权限的 URL 后才启用。历史分析需要 `debug_traceTransaction` 的两个 tracer，`debug_traceCall` 只用于独立模拟探测。不要假设公共 RPC 或供应商免费档支持 debug；套餐、配额、归档范围见 [自动分析参考](analysis.md)。
 
 当前不含 MCP、智能账户写入、部署、资产/授权全量索引、桥、市场、调度和任务恢复；只读内部调用分析属于可选增强能力。完整设计记录见 [plan.MD](../../../plan.MD)。

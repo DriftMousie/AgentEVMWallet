@@ -11,5 +11,6 @@ polygon,primary,,10,false
 polygon,backup,,20,false
 bsc,primary,,10,false
 bsc,backup,,20,false
+bsc,trace-archive-optional,,30,false
 sepolia,primary,,10,false
 sepolia,backup,,20,false

@@ -18,7 +18,7 @@
 
 | 文件 | 能力 |
 |---|---|
-| `chain.py` | 链列表、RPC 检测、Chain ID 验证、区块和费用查询 |
+| `chain.py` | 链列表、RPC/数据源能力探测、Chain ID 验证、区块和费用查询 |
 | `wallet.py` | 钱包 ID/标签、观察钱包、地址校验、原生币与 ERC-20 余额及汇总 |
 | `token.py` | ERC-20 名称、符号、精度、供应量和单位转换 |
 | `transaction.py` | 详情、回执、状态、确认数、Nonce、Gas、解析、模板、加速、取消和同笔重播 |
@@ -80,7 +80,7 @@
 - pending 交易返回已有信息并标记回执缺失；不把未找到回执视为失败。
 - decode 自动按标准 ABI、已验证 ABI、4byte 顺序识别；用户 ABI/完整函数签名优先。歧义返回全部候选，不能当作确定参数。
 - ABI 不匹配保留原始数据并报错，不把选择器候选当成确定语义。
-- 基础查询不依赖区块浏览器；只读分析层可配置 Blockscout、Etherscan V2、4byte 及 RPC trace，失败保留基础结果。
+- 基础查询不依赖区块浏览器；只读分析层可配置 Blockscout、Sourcify V2、Etherscan V2、4byte 及 RPC trace，失败保留基础结果。
 
 ### 3.2 模板
 
@@ -182,11 +182,25 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 
 - 新增 transaction.analyze，保留 inspect 基础查询；decode、事件读取和模板共享分析能力。分析 CLI 不加载私钥，不签名广播。
 - 标准 selector/事件表涵盖 ERC-20、721、1155、WETH、ERC-4626。重名布局和参数语义分别处理，4byte 多候选并列，用户显式 ABI 优先。
-- Blockscout 按链配置，Etherscan V2 可选补充，4byte 最后兜底。公开设置与本地 API Key 文件分离，后者加入 Git 忽略，.env 仍只保存私钥。支持 no-external、缓存、限流与失败降级。
+- Blockscout 按链配置，Sourcify V2 与 Etherscan V2 依次可选补充，4byte 最后兜底。公开设置与本地 API Key 文件分离，后者加入 Git 忽略，.env 仍只保存私钥。支持 no-external、缓存、限流与失败降级。
 - 自动金额注释保留 raw，按日志地址或 vault 底层资产/份额查询精度；NFT ID 不做小数换算，元数据缺失不猜 18 位。
 - counterpart 区分链上名称、源码名称、验证状态、代理及实现；浏览器当前信息不冒充历史事实，同区块升级需结合 trace。
 - 内部调用优先 callTracer，支持回滚传播、DELEGATECALL 执行上下文和常见代理/7702 标记。Blockscout 内部交易仅作为可能不完整的摘要。
 - 余额分别报告交易级原生币 prestate diff、ERC-20 事件流量、区块级历史余额差；后两者不宣称单笔精确余额变化，不静默改查 latest。本轮不含 fork 回放。
 - 业务分类附证据与生效状态，识别无限 ERC-20 授权、明确未验证 spender、验证未知与 NFT 全局授权；不依据名称或已验证标识保证安全。
-- 默认分析预算 60 秒/100 请求、1000 帧/日志、64 层、10 页，历史查询最多 20 个地址和 20 个代币；触限返回 partial。基础交易数据和所有原始日志保留。
+- 默认分析预算 60 秒/100 请求、1000 帧/日志、64 层、10 页，历史查询最多 20 个地址和 20 个代币；触限时受影响组件标记不完整，只有核心或严格模式必需项失败才使总状态 partial。基础交易数据和所有原始日志保留。
 - 回归仅在临时目录运行，不把开发测试文件、真实交易材料或私钥提交到发布目录。详细接口与使用说明维护在 Skill 的 analysis.md 参考中。
+
+
+## 10. 分析准确性与能力诊断修订
+
+- 默认 standard 模式：输入/事件歧义或未解析、规范链问题等进入 warnings 并影响 analysis_status；浏览器、4byte、trace、元数据和历史余额缺失进入结构化 enhancements_missing。complete 只表示核心成功。
+- 新增 --require-trace 严格模式：成功且未截断的 callTracer 和交易级 prestate diff 成为必需项；与 --no-trace 互斥。其他增强仍可缺失。
+- is_value_transfer 仅在正数 value、允许的调用类型且已生效时为 true；may_carry_value 单独表达类型能力。摘要缺少生效证据时正数转移为未知，回滚/零值/DELEGATECALL 不误报。
+- 同时返回 sender/counterpart，区分 EOA、合约、EIP-7702 委托 EOA；本地区块末证据、当前浏览器实现和交易 trace 证据分别注明范围。
+- spender 风险附创建者、创建交易、代码/账户类型及浏览器普通交易计数；未知值不当作 false，不以 nonce 判断历史活动，不因缺创建者而自动提高风险。
+- Sourcify V2 按链开启（发行配置 BSC 默认 true），可设全局/单链 URL。运行时代码匹配才提供权威 ABI；只有创建匹配或 404 不等于当前运行时代码已验证。跨源合并以任一明确已验证优先，保留各来源证据。
+- 全 input 严格 UTF-8 且可打印才展示文本（最多 4096 字符，原始数据保留）。非预编译地址在所查区块无代码时分类 onchain_message/data_only；有代码或创建交易只提示文本候选，明确 ABI 优先。文本不作为 Agent 指令。
+- chain.probe --explorer 对每个 RPC 和已配置来源进行有预算的实时只读探测；可传 --hash，否则最多搜索最近五个区块的真实交易。区分不支持、未配置、鉴权、限流、超时、历史不可用和未测试；不输出 URL/Key、不缓存健康结果。
+- 历史分析依赖 debug_traceTransaction 的 callTracer/prestateTracer diff；debug_traceCall 独立探测模拟能力，不是历史分析前提。供应商套餐和历史范围需核对，不承诺免费档开放 debug。
+- CSV 维持五列，增加默认禁用的 BSC trace/archive 提示行；全部 Markdown 与 Agent 参考文档同步。回归材料在临时目录验证，不纳入发布文件。

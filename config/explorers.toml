@@ -4,30 +4,40 @@
 enabled = true
 base_url = "https://www.4byte.directory"
 
+[sourcify]
+base_url = "https://sourcify.dev/server"
+
 [chains.ethereum]
 blockscout_url = ""
 etherscan = false
+sourcify = false
 
 [chains.base]
 blockscout_url = ""
 etherscan = false
+sourcify = false
 
 [chains.arbitrum]
 blockscout_url = ""
 etherscan = false
+sourcify = false
 
 [chains.optimism]
 blockscout_url = ""
 etherscan = false
+sourcify = false
 
 [chains.polygon]
 blockscout_url = ""
 etherscan = false
+sourcify = false
 
 [chains.bsc]
 blockscout_url = ""
 etherscan = false
+sourcify = true
 
 [chains.sepolia]
 blockscout_url = ""
 etherscan = false
+sourcify = false

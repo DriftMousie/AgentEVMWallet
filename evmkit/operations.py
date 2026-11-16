@@ -19,7 +19,8 @@ BASE = {"chain", "wallet"}
 ANALYSIS = {"external", "trace", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses"}
 # This registry drives both the Python API and the CLI, including unknown-field rejection.
 OPS = {
-    "chain": {"list": set(), "health": {"chain"}, "block": {"chain", "block"}, "fees": {"chain"}},
+    "chain": {"list": set(), "health": {"chain"}, "block": {"chain", "block"}, "fees": {"chain"},
+              "probe": {"chain", "explorer", "hash", "time_budget_seconds", "max_requests"}},
     "wallet": {"list": set(), "balance": BASE | {"address", "token", "block"},
                "balances": {"chain", "wallets", "tokens", "block"}, "validate": {"address"}},
     "token": {"info": {"chain", "token"}, "convert": {"amount", "amount_raw", "decimals"}},
@@ -27,7 +28,7 @@ OPS = {
                     "nonce": BASE | {"address"}, "gas": {"chain"},
                     "wait": {"chain", "hash", "confirmations", "timeout"},
                     "decode": {"chain", "hash", "abi", "signature"} | ANALYSIS,
-                    "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses"} | ANALYSIS,
+                    "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses", "require_trace"} | ANALYSIS,
                     "export-template": {"chain", "hash", "abi", "signature", "output"} | ANALYSIS,
                     "accelerate": BASE | WRITE | {"hash"}, "cancel": BASE | WRITE | {"hash"},
                     "replay": BASE | {"hash", "execute", "wait", "confirmations", "timeout"}},
@@ -114,7 +115,7 @@ class Toolkit:
             require(module in OPS and operation in OPS[module], "Unknown operation")
             require(isinstance(params, dict), "params must be an object")
             require(not (set(params) - OPS[module][operation]), "Unknown operation parameters")
-            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace"):
+            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer"):
                 if key in params: require(isinstance(params[key], bool), f"{key} must be boolean")
             if params.get("chain"):
                 chain_id = self.config.chain(params["chain"])["chain_id"]
@@ -149,6 +150,19 @@ class Toolkit:
         return {**fee_summary(fees(rpc, chain, {})), "scope": "EVM execution; excludes chain-specific data fees"}
 
     transaction_gas = chain_fees
+
+    def chain_probe(self, p):
+        from .probe import probe
+        from types import SimpleNamespace
+        chain = self.config.chain(p.get("chain"))
+        error = None
+        try: _, rpc = self.rpc(p)
+        except ToolError as exc:
+            error = {"status": "unavailable", "reason": exc.code, "message": exc.message}
+            rpc = SimpleNamespace(clients=[])
+        report = probe(self.config, chain, rpc, p)
+        if error: report["rpc_configuration"] = error
+        return report
 
     def wallet_list(self, p):
         rows = []
@@ -253,8 +267,12 @@ class Toolkit:
             decoded = analyzer.decode_input(data, inspected["transaction"].get("to"), p.get("abi"), p.get("signature"))
         except ToolError as exc:
             raise ToolError(exc.code, exc.message, data={"data": data, "inspection": inspected}) from None
-        self.warnings.extend(analyzer.issues+analyzer.sources.warnings)
-        return {"data": data, "decoded": decoded, "inspection": inspected}
+        if decoded.get("status") not in ("decoded", "onchain_message", "data_only", "empty"):
+            analyzer.issue("INPUT_UNRESOLVED", required=True)
+        warnings, enhancements = analyzer.diagnostics()
+        self.warnings.extend(warnings)
+        return {"data": data, "decoded": decoded, "inspection": inspected,
+                "analysis_status": "partial" if warnings else "complete", "enhancements_missing": enhancements}
 
     def transaction_analyze(self, p):
         from .analysis import Analyzer
@@ -574,14 +592,17 @@ class Toolkit:
         for index, row in enumerate(ordered):
             if index >= analyzer.options["max_frames"]:
                 row["decoded"] = {"status": "unavailable", "reason": "Event enrichment limit"}
-                analyzer.issue("EVENTS_TRUNCATED")
+                analyzer.issue("EVENTS_TRUNCATED", required=True)
                 continue
             analyzer.block = hex(row["blockNumber"])
             analyzer.memo = block_memos.setdefault(analyzer.block, {})
-            row["decoded"] = analyzer.attempt(lambda: analyzer.decode_event(row, p.get("abi")), "EVENT_DECODE") or {"status": "unknown", "event": None, "args": None}
-        self.warnings.extend(analyzer.issues+analyzer.sources.warnings)
+            row["decoded"] = analyzer.attempt(lambda: analyzer.decode_event(row, p.get("abi")), "EVENT_DECODE", required=True) or {"status": "unknown", "event": None, "args": None}
+            if row["decoded"].get("status") != "decoded": analyzer.issue("EVENTS_UNRESOLVED", required=True)
+        warnings, enhancements = analyzer.diagnostics()
+        self.warnings.extend(warnings)
         return {"logs": ordered, "completed_through": completed, "complete": True,
-                "enrichment_status": "complete" if not analyzer.issues and not analyzer.sources.warnings and all(row["decoded"].get("status") == "decoded" for row in ordered) else "partial"}
+                "analysis_status": "partial" if warnings else "complete", "enhancements_missing": enhancements,
+                "enrichment_status": "partial" if warnings or enhancements else "complete"}
 
     def batch_run(self, p):
         require((p.get("items") is None) != (p.get("file") is None), "Provide items or file")
