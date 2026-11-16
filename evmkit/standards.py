@@ -67,7 +67,48 @@ ERC4626 = ERC20 + [
     E("Deposit", [("sender", "address", True), ("owner", "address", True), ("assets", "uint256", False), ("shares", "uint256", False)]),
     E("Withdraw", [("sender", "address", True), ("receiver", "address", True), ("owner", "address", True), ("assets", "uint256", False), ("shares", "uint256", False)]),
 ]
-PRESETS = {"erc20": ERC20, "erc721": ERC721, "erc1155": ERC1155, "weth": WETH, "erc4626": ERC4626}
+ROUTE = [("path", "address[]"), ("to", "address"), ("deadline", "uint256")]
+V2_ROUTER = [
+    F(name, amounts + ROUTE, [] if "SupportingFeeOnTransferTokens" in name else [("amounts", "uint256[]")],
+      "payable" if name.startswith(("swapExactETH", "swapETH")) else "nonpayable")
+    for name, amounts in [
+        ("swapExactTokensForTokens", [("amountIn", "uint256"), ("amountOutMin", "uint256")]),
+        ("swapTokensForExactTokens", [("amountOut", "uint256"), ("amountInMax", "uint256")]),
+        ("swapExactETHForTokens", [("amountOutMin", "uint256")]),
+        ("swapTokensForExactETH", [("amountOut", "uint256"), ("amountInMax", "uint256")]),
+        ("swapExactTokensForETH", [("amountIn", "uint256"), ("amountOutMin", "uint256")]),
+        ("swapETHForExactTokens", [("amountOut", "uint256")]),
+        ("swapExactTokensForTokensSupportingFeeOnTransferTokens", [("amountIn", "uint256"), ("amountOutMin", "uint256")]),
+        ("swapExactETHForTokensSupportingFeeOnTransferTokens", [("amountOutMin", "uint256")]),
+        ("swapExactTokensForETHSupportingFeeOnTransferTokens", [("amountIn", "uint256"), ("amountOutMin", "uint256")]),
+    ]
+]
+POOL_TOKENS = [F("token0", outputs=[("token", "address")]), F("token1", outputs=[("token", "address")])]
+V2_PAIR = POOL_TOKENS + [
+    E("Swap", [("sender", "address", True), ("amount0In", "uint256", False), ("amount1In", "uint256", False),
+               ("amount0Out", "uint256", False), ("amount1Out", "uint256", False), ("to", "address", True)]),
+    E("Mint", [("sender", "address", True), ("amount0", "uint256", False), ("amount1", "uint256", False)]),
+    E("Burn", [("sender", "address", True), ("amount0", "uint256", False), ("amount1", "uint256", False), ("to", "address", True)]),
+    E("Sync", [("reserve0", "uint112", False), ("reserve1", "uint112", False)]),
+]
+V3_SWAP = [("sender", "address", True), ("recipient", "address", True), ("amount0", "int256", False),
+           ("amount1", "int256", False), ("sqrtPriceX96", "uint160", False), ("liquidity", "uint128", False), ("tick", "int24", False)]
+V3_COMMON = POOL_TOKENS + [
+    E("Initialize", [("sqrtPriceX96", "uint160", False), ("tick", "int24", False)]),
+    E("Mint", [("sender", "address", False), ("owner", "address", True), ("tickLower", "int24", True), ("tickUpper", "int24", True),
+               ("amount", "uint128", False), ("amount0", "uint256", False), ("amount1", "uint256", False)]),
+    E("Burn", [("owner", "address", True), ("tickLower", "int24", True), ("tickUpper", "int24", True),
+               ("amount", "uint128", False), ("amount0", "uint256", False), ("amount1", "uint256", False)]),
+    E("Collect", [("owner", "address", True), ("recipient", "address", False), ("tickLower", "int24", True), ("tickUpper", "int24", True),
+                  ("amount0", "uint128", False), ("amount1", "uint128", False)]),
+    E("Flash", [("sender", "address", True), ("recipient", "address", True), ("amount0", "uint256", False), ("amount1", "uint256", False),
+                ("paid0", "uint256", False), ("paid1", "uint256", False)]),
+]
+UNISWAP_V3_POOL = V3_COMMON + [E("Swap", V3_SWAP)]
+PANCAKE_V3_POOL = V3_COMMON + [E("Swap", V3_SWAP + [("protocolFeesToken0", "uint128", False), ("protocolFeesToken1", "uint128", False)])]
+PRESETS = {"erc20": ERC20, "erc721": ERC721, "erc1155": ERC1155, "weth": WETH, "erc4626": ERC4626,
+           "uniswap_v2_router": V2_ROUTER, "dex_v2_pair": V2_PAIR,
+           "uniswap_v3_pool": UNISWAP_V3_POOL, "pancake_v3_pool": PANCAKE_V3_POOL}
 
 
 def preset(name):

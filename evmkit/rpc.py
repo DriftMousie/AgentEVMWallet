@@ -94,13 +94,16 @@ class RPC:
             if rpc_name is not None and name != rpc_name: continue
             try:
                 url = client.provider.endpoint_uri
-                response = json_request("POST", url, timeout=min(10, budget.spend()),
-                                        payload={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
-                if response.get("error"):
-                    last_code = optional_error_code(response["error"])
-                    continue
-                require(int(response.get("result", "0x0"), 16) == self.chain["chain_id"],
-                        "Analysis RPC Chain ID mismatch", "CHAIN_ID_MISMATCH")
+                validation_key = (id(self), name)
+                if validation_key not in budget.validated_rpcs:
+                    response = json_request("POST", url, timeout=min(10, budget.spend("chain_validation")),
+                                            payload={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
+                    if response.get("error"):
+                        last_code = optional_error_code(response["error"])
+                        continue
+                    require(int(response.get("result", "0x0"), 16) == self.chain["chain_id"],
+                            "Analysis RPC Chain ID mismatch", "CHAIN_ID_MISMATCH")
+                    budget.validated_rpcs.add(validation_key)
                 response = json_request("POST", url, timeout=min(15, budget.spend()),
                                         payload={"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
                 if response.get("error"):

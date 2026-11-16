@@ -15,10 +15,14 @@ def provider_error_code(data):
 
 
 class Budget:
-    def __init__(self, seconds=60, requests_limit=100):
+    def __init__(self, seconds=60, requests_limit=300):
         self.deadline = time.monotonic() + seconds
         self.requests_limit = requests_limit
         self.requests = 0
+        self.phase = "other"
+        self.by_stage = {}
+        self.validated_rpcs = set()
+        self.reserve_requests = 0
 
     def remaining(self):
         left = self.deadline - time.monotonic()
@@ -26,10 +30,13 @@ class Budget:
             raise ToolError("ANALYSIS_LIMIT", "Analysis time budget exhausted")
         return left
 
-    def spend(self):
-        if self.requests >= self.requests_limit:
+    def spend(self, stage=None):
+        self.remaining()
+        if self.requests >= self.requests_limit - self.reserve_requests:
             raise ToolError("ANALYSIS_LIMIT", "Analysis request budget exhausted")
         self.requests += 1
+        category = stage or self.phase
+        self.by_stage[category] = self.by_stage.get(category, 0) + 1
         return self.remaining()
 
 

@@ -42,6 +42,8 @@
 
 需要完整内部调用和交易级原生币变化时，RPC 应支持 `debug_traceTransaction` 的 callTracer 与 prestateTracer diff；公共节点未必开放。可告诉 Agent：“请探测 BSC 的 RPC 和浏览器能力”，它会运行 `chain.py probe --chain bsc --explorer`。供应商权限和历史范围详见 Skill，不要求 `debug_traceCall` 才能分析历史交易。
 
+支持常见 V2 swap 的路径金额绑定，以及 V2/V3 池子的 Swap、Mint/Burn 等事件；会区分“至少输出”和实际成交。可直接告诉 Agent：“分析这笔 swap 的输入、最低输出和池子事件”。
+
 标准分析的 `complete` 表示核心输入与事件已解析；可选能力缺失另列 `enhancements_missing`。需要严格完整追踪时，让 Agent 使用 `--require-trace`。
 
 有疑问或建议可以添加我的联系方式

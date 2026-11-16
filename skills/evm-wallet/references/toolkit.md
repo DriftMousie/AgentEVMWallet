@@ -61,7 +61,7 @@ TOML 的 `[rpc] csv_file = "rpc.csv"` 指定 CSV 路径，相对路径以 TOML �
 
 ## 自动分析入口
 
-`transaction.py decode` 现在自动识别标准 selector，并按配置补充已验证 ABI/4byte 候选。完整分析使用 `transaction.py analyze --chain … --hash …`；加 `--require-trace` 要求 callTracer 与 prestate diff 都完整成功；`inspect` 保持基础查询。事件日志也可自动解码标准布局。标准分析将核心失败放入 warnings，将可选源缺失放入 data.enhancements_missing；complete 不等于所有增强成功。身份同时包含 sender 和 counterpart（含 7702），支持全文 UTF-8 留言识别。已验证 ABI 按 Blockscout → Sourcify → Etherscan 顺序补充，4byte 最后兜底。数据源配置、历史精度、风险和调用树的完整性说明见 [自动分析参考](analysis.md)。
+`transaction.py decode` 现在自动识别标准 selector，并按配置补充已验证 ABI/4byte 候选。完整分析使用 `transaction.py analyze --chain … --hash …`；加 `--require-trace` 要求 callTracer 与 prestate diff 都完整成功；`inspect` 保持基础查询。事件日志也可自动解码标准布局。标准分析将核心失败放入 warnings，将可选源缺失放入 data.enhancements_missing；complete 不等于所有增强成功。身份同时包含 sender 和 counterpart（含 7702），支持全文 UTF-8 留言识别。已验证 ABI 按 Blockscout → Sourcify → Etherscan 顺序补充，4byte 最后兜底。常见 V2 Router swap 可按路径换算输入/最低输出，池子事件支持 V2 与 Uniswap/Pancake V3 布局；金额角色与池子视角必须保留。默认增强预算为 300 请求/60 秒，已有显式配置仍优先；capabilities.requests_by_stage 显示阶段消耗。数据源配置、历史精度、风险和调用树的完整性说明见 [自动分析参考](analysis.md)。
 
 ## 模块与调用
 
@@ -157,9 +157,10 @@ EIP-1559 链的 `fee_model` 为 `eip1559`，`fees` 包含 `maxFeePerGas` 和 `ma
 ### ABI 的选择
 
 - 标准 ERC-20 只读调用可不传 `--abi`：支持 `balanceOf(address)`、`allowance(address,address)`、`name()`、`symbol()`、`decimals()`、`totalSupply()`，函数名或完整签名均可。
-- 内置 ABI 包括 erc20、erc721、erc1155、weth、erc4626。`--abi erc20` 显式选择 ERC-20 ABI，不访问外部网站、不依赖工作目录中的 ABI 文件。包含常用查询、transfer/approve/transferFrom 和 Transfer/Approval 事件，可用于函数列表、编解码、合约调用、交易解析和事件解码等现有 ABI 接口。
+- 内置 ABI 包括 erc20、erc721、erc1155、weth、erc4626、uniswap_v2_router、dex_v2_pair、uniswap_v3_pool、pancake_v3_pool。`--abi erc20` 显式选择 ERC-20 ABI，不访问外部网站、不依赖工作目录中的 ABI 文件。包含常用查询、transfer/approve/transferFrom 和 Transfer/Approval 事件，可用于函数列表、编解码、合约调用、交易解析和事件解码等现有 ABI 接口。
 - 自定义 ABI 仍支持 JSON 数组文件、包含 `abi` 的 artifact 或 JSON 请求中的内联数据；不会被内置 ABI 覆盖。自定义写操作应明确提供 ABI；省略 ABI 只对上述 ERC-20 只读调用生效，其他函数返回 `ABI_REQUIRED`。
 - `examples/contract-abi.json` 仅演示 set/get 自定义合约，不是 ERC-20 ABI，也不代表任何链上部署。真实代币优先使用内置 `erc20`；已有 `examples/erc20.abi.json` 或其他 ABI 文件也可照常使用。
+- DeFi 预设 uniswap_v2_router 覆盖常见九种 V2 swap；dex_v2_pair 提供 token0/token1 与 Swap/Mint/Burn/Sync；uniswap_v3_pool、pancake_v3_pool 提供池子资产查询与常见事件（两者 Swap 布局不同）。这是兼容接口模式，不是官方部署白名单；自动匹配不因此让模板变成已确认可执行。
 - 内置接口不保证非标准代币都实现这些方法；调用失败需核对 ABI 和实际合约。查询 `balanceOf`、`allowance`、`totalSupply` 返回最小单位原始值，结合 decimals 换算，不把结果直接解释成整枚代币。
 
 JSON 请求示例（地址替换为实际值）：
@@ -220,7 +221,7 @@ python token.py --input-json examples/convert-request.json
 echo '{"operation":"convert","params":{"amount":"1.25","decimals":6}}' | python token.py --input-json -
 ```
 
-输入固定为 `{"operation":"...","params":{...}}`，JSON 输入不能混入业务 CLI 参数。ABI、模板、typed_data 在 JSON 请求里可直接使用对象或数组，在 CLI 中使用文件路径；ABI 另支持内置名称 erc20、erc721、erc1155、weth、erc4626，标准 ERC-20 的 contract call 可省略 ABI。
+输入固定为 `{"operation":"...","params":{...}}`，JSON 输入不能混入业务 CLI 参数。ABI、模板、typed_data 在 JSON 请求里可直接使用对象或数组，在 CLI 中使用文件路径；ABI 另支持内置名称 erc20、erc721、erc1155、weth、erc4626、uniswap_v2_router、dex_v2_pair、uniswap_v3_pool、pancake_v3_pool，标准 ERC-20 的 contract call 可省略 ABI。
 
 输出固定为：
 
@@ -245,7 +246,7 @@ response = transfer.run({"chain": "base", "wallet": "trading", "to": "0x00000000
 
 ## 交易执行与故障处理
 
-- 每个 RPC 使用前验证 Chain ID。读请求有限重试并可切换端点；发送只尝试一次。
+- 普通读写保留 Chain ID 校验；分析增强在每轮、每个端点首次使用时校验，切换新端点重验。读请求有限重试并可切换端点；发送只尝试一次。
 - 预览不预留 Nonce，执行时重新读取和模拟。Gas 默认估算值乘 1.2 并向上取整。
 - 支持 `--gas-price-wei`，或 `--max-fee-per-gas-wei` 和 `--max-priority-fee-per-gas-wei`；两类费用互斥。
 - 模拟失败默认停止。显式绕过必须同时提供 `--skip-simulation --gas 300000 --reason '具体原因'`。仍检查地址、Chain ID 和余额。

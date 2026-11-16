@@ -78,7 +78,7 @@ class Sources:
             if connection: connection.close()
         query = dict(params or {})
         if api_key: query["apikey"] = api_key
-        data = json_request("GET", url, params=query, timeout=min(10, self.budget.spend()))
+        data = json_request("GET", url, params=query, timeout=min(10, self.budget.spend("external")))
         require(not api_key or api_key not in json.dumps(data), "Optional provider reflected credentials; response discarded", "SOURCE_UNAVAILABLE")
         failure = provider_error_code(data)
         if failure:

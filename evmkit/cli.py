@@ -56,7 +56,7 @@ def main(module, argv=None):
             elif field in NUM_FIELDS:
                 kwargs["type"] = int
             elif field == "abi":
-                kwargs["help"] = "ABI JSON file or preset: erc20, erc721, erc1155, weth, erc4626; transaction decode also auto-detects"
+                kwargs["help"] = "ABI JSON file or preset: erc20, erc721, erc1155, weth, erc4626, uniswap_v2_router, dex_v2_pair, uniswap_v3_pool, pancake_v3_pool; transaction decode also auto-detects"
             elif field in {"gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei"}:
                 kwargs["help"] = "Integer wei per gas, NOT gwei (1 gwei = 1000000000 wei)"
             if field == "require_trace": kwargs["help"] = "Require both callTracer and prestateTracer diff; optional source failures otherwise do not lower core status"

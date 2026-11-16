@@ -188,7 +188,7 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 - 内部调用优先 callTracer，支持回滚传播、DELEGATECALL 执行上下文和常见代理/7702 标记。Blockscout 内部交易仅作为可能不完整的摘要。
 - 余额分别报告交易级原生币 prestate diff、ERC-20 事件流量、区块级历史余额差；后两者不宣称单笔精确余额变化，不静默改查 latest。本轮不含 fork 回放。
 - 业务分类附证据与生效状态，识别无限 ERC-20 授权、明确未验证 spender、验证未知与 NFT 全局授权；不依据名称或已验证标识保证安全。
-- 默认分析预算 60 秒/100 请求、1000 帧/日志、64 层、10 页，历史查询最多 20 个地址和 20 个代币；触限时受影响组件标记不完整，只有核心或严格模式必需项失败才使总状态 partial。基础交易数据和所有原始日志保留。
+- 默认分析预算 60 秒/300 请求、1000 帧/日志、64 层、10 页，历史查询最多 20 个地址和 20 个代币；触限时受影响组件标记不完整，只有核心或严格模式必需项失败才使总状态 partial。基础交易数据和所有原始日志保留。
 - 回归仅在临时目录运行，不把开发测试文件、真实交易材料或私钥提交到发布目录。详细接口与使用说明维护在 Skill 的 analysis.md 参考中。
 
 
@@ -204,3 +204,13 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 - chain.probe --explorer 对每个 RPC 和已配置来源进行有预算的实时只读探测；可传 --hash，否则最多搜索最近五个区块的真实交易。区分不支持、未配置、鉴权、限流、超时、历史不可用和未测试；不输出 URL/Key、不缓存健康结果。
 - 历史分析依赖 debug_traceTransaction 的 callTracer/prestateTracer diff；debug_traceCall 独立探测模拟能力，不是历史分析前提。供应商套餐和历史范围需核对，不承诺免费档开放 debug。
 - CSV 维持五列，增加默认禁用的 BSC trace/archive 提示行；全部 Markdown 与 Agent 参考文档同步。回归材料在临时目录验证，不纳入发布文件。
+
+
+## 11. DeFi 路径金额、池子事件与请求复用
+
+- 内置 uniswap_v2_router 九种常见 swap；已确定 ABI 的 amountIn/amountInMax 绑定 address[] path 首项，amountOut/amountOutMin 绑定末项，保留精确/最高/最低角色、raw 与绑定证据。自定义 ABI 仅按明确类型/名称约定，4byte 候选不做确定绑定；原生币与包装代币分别表达。
+- 增加 dex_v2_pair 的 Swap/Mint/Burn/Sync；增加 Uniswap/Pancake V3 的 Swap/Mint/Burn/Collect/Flash/Initialize，分别维护不同 Swap 布局。池子金额通过历史 token0/token1 解析，V3 signed delta 为池子视角，储备/流动性不混为转账，不重复累计 Transfer 流量。WETH/ERC-4626 保持各自规则。
+- 分析 Chain ID 每轮每端点首次校验，故障切换新端点重验；同轮复用历史调用成功结果和池子元数据。核心解析和必需 trace 优先，为结束区块校验预留最多两次请求；余额输出单独覆盖统计和 omitted_pairs。
+- 默认 max_requests=300，时间维持 60 秒；保留用户显式配置/CLI 覆盖。新增 requests_by_stage，计数包含增强阶段实际 HTTP 请求，不含基础 inspect。
+- 用户 BSC 单跳样本在 100/200/300/500 各档冷缓存为 34 次请求、热缓存 33 次，9/9 组历史余额完成；默认时限另测 7.24 秒。公共节点不支持两类 trace，因此不宣称全能力完成；细分数据和限制见 analysis.md。
+- 同步全部五份 Markdown，开发回归与真实交易材料仅保留临时目录。此次不包含 V3 packed path、Universal Router 或任意聚合器指令流解析。

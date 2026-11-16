@@ -9,7 +9,7 @@ from .abi import canonical, decode_call, encode_call, load_abi
 from .common import ToolError, address, formatted, hexdata, jsonable, require, uint
 from .explorers import Sources
 from .network import Budget
-from .standards import entries
+from .standards import entries, V2_ROUTER
 from .diagnostics import missing, combine
 
 ZERO = "0x" + "0"*40
@@ -35,7 +35,7 @@ def text_input(data):
 
 
 def settings(config, params):
-    defaults = {"time_budget_seconds": 60, "max_requests": 100, "max_frames": 1000,
+    defaults = {"time_budget_seconds": 60, "max_requests": 300, "max_frames": 1000,
                 "max_depth": 64, "max_pages": 10, "max_tokens": 20, "max_addresses": 20}
     raw = config.raw.get("analysis", {})
     for key, default in defaults.items():
@@ -81,7 +81,12 @@ class Analyzer:
         return list(self.issues), combine(self.enhancements_missing, optional)
 
     def query(self, method, params):
-        return self.rpc.optional_request(method, params, self.budget)
+        cacheable = method in ("eth_call", "eth_getCode", "eth_getBalance", "eth_getStorageAt")
+        key = ("rpc", method, json.dumps(params, sort_keys=True))
+        if cacheable and key in self.memo: return self.memo[key]
+        value = self.rpc.optional_request(method, params, self.budget)
+        if cacheable: self.memo[key] = value
+        return value
 
     def attempt(self, fn, code, required=False):
         try: return fn()
@@ -226,14 +231,16 @@ class Analyzer:
             return {"status": "empty", "input_kind": "empty", "selector": None, "source": "none", "candidates": []}
         builtin = self.candidates(data, entries("function"))
         if builtin:
-            if target:
+            token_standards = {"erc20", "erc721", "erc1155", "weth", "erc4626"}
+            if target and any(token_standards.intersection(c["standards"]) for c in builtin):
                 vault = any("erc4626" in c["standards"] and c["signature"].split("(")[0] in ("deposit", "mint", "withdraw", "redeem") for c in builtin)
                 kind = self.kind(context or target, vault)
                 selected = [c for c in builtin if kind and kind in c["standards"]]
                 if selected: builtin = selected
             else: kind = None
             if len(builtin) == 1:
-                return {**builtin[0], "confidence": "interface_evidence" if kind else "standard_pattern", "template_safe": kind is not None}
+                evidenced = kind is not None and kind in builtin[0]["standards"]
+                return {**builtin[0], "confidence": "interface_evidence" if evidenced else "standard_pattern", "template_safe": evidenced}
         text = text_input(data)
         if target and int(address(target), 16) > 0x11:
             code = self.attempt(lambda: self.code(context or target), "INPUT_ACCOUNT_CODE")
@@ -279,8 +286,49 @@ class Analyzer:
                 "amount_readable": f"{readable} {meta['symbol']}" if readable is not None and meta["symbol"] else None,
                 "source": meta["source"], "block": self.block}
 
-    def input_amounts(self, decoded, target):
+    def route_amounts(self, decoded, value_wei=None):
+        """Known Router layouts, or typed/named ABI parameters; never 4byte guesses."""
+        if decoded.get("status") != "decoded": return []
+        signature = decoded.get("signature")
+        layout = next((item for item in V2_ROUTER if canonical(item) == signature), None)
+        names = [field["name"] for field in layout["inputs"]] if layout else list(decoded.get("named_args", {}))
+        types, values = decoded.get("types", []), decoded.get("args", [])
+        if len(names) != len(types) or len(names) != len(values) or "path" not in names: return []
+        index = names.index("path")
+        if types[index] != "address[]": return []
+        if not isinstance(values[index], (list, tuple)) or len(values[index]) < 2:
+            self.issue("ROUTE_AMOUNTS:INVALID_PATH"); return []
+        try:
+            path = [address(item) for item in values[index]]
+            require(all(int(item,16)>0 for item in path), "Zero-address route is not a standard token path")
+        except ToolError:
+            self.issue("ROUTE_AMOUNTS:INVALID_PATH"); return []
+        roles = {"amountIn": (0, "input_exact"), "amountInMax": (0, "input_maximum"),
+                 "amountOut": (-1, "output_exact"), "amountOutMin": (-1, "output_minimum")}
+        out = []
+        name = layout["name"] if layout else ""
+        native_output = layout is not None and (name.endswith("ForETH") or "ForETHSupporting" in name or name == "swapTokensForExactETH")
+        for argument, (position, role) in roles.items():
+            if argument not in names: continue
+            param_index = names.index(argument)
+            if types[param_index] != "uint256": continue
+            native = position == -1 and native_output
+            annotation = self.amount(values[param_index], None if native else path[position], argument, native=native)
+            annotation.update(role=role, binding={"kind":"path", "parameter":"path", "index":position,
+                              "address":path[position], "source":"builtin_router" if layout else "abi_parameter_convention"})
+            if native: annotation["wrapped_token_address"] = path[position]
+            out.append(annotation)
+        if layout and layout["stateMutability"] == "payable" and value_wei is not None:
+            annotation = self.amount(value_wei, native=True, argument="transaction.value")
+            annotation.update(role="input_maximum" if name == "swapETHForExactTokens" else "input_exact",
+                              wrapped_token_address=path[0], binding={"kind":"call_value", "source":"builtin_router", "path_index":0})
+            out.insert(0, annotation)
+        return out
+
+    def input_amounts(self, decoded, target, value_wei=None):
         if decoded.get("status") != "decoded" or not target: return []
+        routed = self.route_amounts(decoded, value_wei)
+        if routed: return routed
         name = decoded["signature"].split("(")[0]
         kind = self.kind(target, name in ("deposit", "mint", "withdraw", "redeem"))
         args = decoded["args"]
@@ -293,6 +341,31 @@ class Analyzer:
         if name == "withdraw" and decoded["signature"] == "withdraw(uint256)":
             return [self.amount(args[0], target, argument="wad")]
         return []
+
+    def pool_amounts(self, decoded, target):
+        families = {"dex_v2_pair", "uniswap_v3_pool", "pancake_v3_pool"}
+        if not families.intersection(decoded.get("standards", [])): return []
+        args = decoded["args"]
+        fields = [key for key in args if key in {"amount0", "amount1", "amount0In", "amount1In", "amount0Out", "amount1Out",
+                   "reserve0", "reserve1", "paid0", "paid1", "protocolFeesToken0", "protocolFeesToken1"}]
+        if not fields: return []
+        tokens = [self.quiet_call(target, f"token{i}()", [], ["address"]) for i in (0,1)]
+        if not all(tokens) or tokens[0] == tokens[1] or ZERO in tokens:
+            self.issue("POOL_ASSETS:UNAVAILABLE")
+            return []
+        out = []
+        for field in fields:
+            position = 0 if "0" in field else 1
+            raw = int(args[field]); annotation = self.amount(abs(raw), tokens[position], field)
+            annotation["raw"] = str(raw)
+            if raw < 0:
+                annotation["amount"] = signed_format(raw, annotation["decimals"]) if annotation["decimals"] is not None else None
+                annotation["amount_readable"] = f"{annotation['amount']} {annotation['symbol']}" if annotation["amount"] is not None and annotation["symbol"] else None
+            role = "reserve" if field.startswith("reserve") else "pool_input" if field.endswith("In") else "pool_output" if field.endswith("Out") else "protocol_fee" if field.startswith("protocolFees") else "repaid" if field.startswith("paid") else "pool_delta" if decoded["event"] == "Swap" else "event_amount"
+            annotation.update(role=role, scope="pool", binding={"kind":"pool_token", "pool_address":target,
+                              "function":f"token{position}()", "block":self.block})
+            out.append(annotation)
+        return out
 
     @staticmethod
     def decode_event_item(log, item):
@@ -328,8 +401,13 @@ class Analyzer:
                     item = record["abi"]
                     if item.get("type") != "event": continue
                     args = self.decode_event_item(log, item)
+                    standards = record.get("standards", [])
+                    if not standards:
+                        layout = lambda value: [(f.get("name"), f["type"], bool(f.get("indexed"))) for f in value["inputs"]]
+                        standards = sorted({s for known in entries("event") if canonical(known["abi"]) == canonical(item)
+                                            and layout(known["abi"]) == layout(item) for s in known["standards"]})
                     result.append({"status": "decoded", "event": item["name"], "signature": canonical(item), "args": args,
-                                   "standards": record.get("standards", []), "source": record.get("source", "builtin")})
+                                   "standards": standards, "source": record.get("source", "builtin")})
                 except Exception: continue
             return result
         selected = matches([{"abi": i, "source": "explicit"} for i in load_abi(abi)]) if abi is not None else matches(entries("event"))
@@ -353,6 +431,7 @@ class Analyzer:
             if asset: amounts.append(self.amount(args["assets"], asset, "assets"))
             amounts.append(self.amount(args["shares"], target, "shares"))
         out["amounts"] = amounts
+        out["amounts"].extend(self.pool_amounts(out, target))
         if len(amounts) == 1: out["amount_readable"] = amounts[0]["amount_readable"]
         return out
 
@@ -455,6 +534,8 @@ class Analyzer:
         if not decoded or decoded.get("status") != "decoded":
             return {"type": "unknown", "evidence": [], "committed": committed}, []
         signature = decoded["signature"]
+        if any(canonical(item) == signature for item in V2_ROUTER):
+            return {"type":"token_swap", "confidence":decoded.get("confidence"), "evidence":[signature, "V2 router function pattern"], "committed":committed}, []
         name = signature.split("(")[0]
         args = decoded.get("args", [])
         kind = self.kind(target, name in ("deposit", "mint", "withdraw", "redeem")) if target else None
@@ -504,10 +585,11 @@ class Analyzer:
         if not receipt or self.inspection["status"] == "reorged":
             return {"status": "unavailable", "reason": "No canonical mined receipt", "native_transaction": [], "token_event_flows": [], "block_level": []}
         subjects = self.subjects(transaction, events)
-        native, flows, block_rows, tokens = [], {}, [], []
+        native, flows, block_rows, tokens, omitted = [], {}, [], [], []
         supplied_tokens = self.params.get("tokens", [])
         require(isinstance(supplied_tokens, list), "tokens must be a JSON array")
         tokens.extend(address(t) for t in supplied_tokens)
+        tokens.extend(self.memo.get("route_tokens", []))
         target = address(transaction["to"]) if transaction.get("to") else None
         if target and (self.memo.get(("kind", target, False)) == "erc20" or self.memo.get(("kind", target, True)) == "erc4626"):
             tokens.append(target)
@@ -568,8 +650,16 @@ class Analyzer:
         if number == 0:
             self.issue("GENESIS_HAS_NO_PREVIOUS_BLOCK")
         else:
+            planned = len(subjects) * (len(tokens)+1)
             for who in subjects:
                 for token in [None]+tokens:
+                    capacity = self.budget.requests_limit - self.budget.reserve_requests - self.budget.requests
+                    try: self.budget.remaining()
+                    except ToolError: capacity = 0
+                    if capacity < 2:
+                        self.issue("BLOCK_BALANCES:ANALYSIS_LIMIT")
+                        omitted.append({"address":who, "token_address":token})
+                        continue
                     def read_balance(block):
                         return int(self.query("eth_getBalance", [who, hex(block)]), 16) if token is None else self.call(token, "balanceOf(address)", [who], ["uint256"], hex(block))
                     a = self.attempt(lambda: read_balance(number-1), "BLOCK_PRE_BALANCE")
@@ -582,21 +672,30 @@ class Analyzer:
                                        "symbol": meta["symbol"], "scope": "block", "source": "historical_rpc",
                                        "status": "complete" if a is not None and b is not None else "unavailable",
                                        "is_transaction_attribution": False})
-        return {"status": "complete" if native_status == "complete" and all(r["status"] == "complete" for r in block_rows) else "partial",
+        block_complete = number == 0 or len(block_rows) == planned and all(r["status"] == "complete" for r in block_rows)
+        return {"status": "complete" if native_status == "complete" and block_complete else "partial",
                 "native_transaction_status": native_status, "native_transaction": native,
                 "token_event_flows_status": "not_applicable" if receipt["status"] != 1 else "partial" if "EVENTS_TRUNCATED" in self.issues or any(e["decoded"].get("status") != "decoded" for e in events) else "complete",
                 "token_event_flows": token_rows, "block_level": block_rows,
+                "block_level_status": "not_applicable" if number == 0 else "complete" if len(block_rows) == planned and all(r["status"] == "complete" for r in block_rows) else "partial",
+                "block_level_coverage": {"planned_pairs": 0 if number == 0 else planned, "attempted_pairs":len(block_rows),
+                                         "completed_pairs":sum(r["status"] == "complete" for r in block_rows), "omitted_pairs":omitted},
                 "execution_fee_paid_wei": self.inspection.get("execution_fee_paid_wei"),
                 "limitations": ["Event flows are not guaranteed token balance changes", "Block differences may include other transactions"]}
 
     def run(self):
+        self.budget.reserve_requests = min(2, max(0,self.options["max_requests"]-1))
+        self.budget.phase = "input_decode"
         tx, receipt = self.inspection["transaction"], self.inspection["receipt"]
         if self.params.get("abi") is not None or self.params.get("signature") is not None:
             decoded = self.decode_input(tx["data"], tx.get("to"), self.params.get("abi"), self.params.get("signature"))
         else:
             decoded = self.attempt(lambda: self.decode_input(tx["data"], tx.get("to")), "INPUT_DECODE", required=True) or {"status": "unknown", "candidates": []}
-        amounts = self.attempt(lambda: self.input_amounts(decoded, tx.get("to")), "INPUT_AMOUNTS") or []
-        if int(tx.get("value", 0)) > 0: amounts.append(self.amount(tx["value"], native=True, argument="transaction.value"))
+        self.budget.phase = "amounts"
+        amounts = self.attempt(lambda: self.input_amounts(decoded, tx.get("to"), tx.get("value",0)), "INPUT_AMOUNTS") or []
+        if int(tx.get("value", 0)) > 0 and not any(a["argument"] == "transaction.value" for a in amounts):
+            amounts.append(self.amount(tx["value"], native=True, argument="transaction.value"))
+        self.budget.phase = "events"
         events = []
         raw_logs = receipt.get("logs", []) if receipt else []
         for log in raw_logs[:self.options["max_frames"]]:
@@ -605,10 +704,12 @@ class Analyzer:
             events.append({"address": log["address"], "log_index": log.get("logIndex"),
                            "decoded": event or {"status": "unknown", "event": None, "args": None}})
         if len(raw_logs)>len(events): self.issue("EVENTS_TRUNCATED", required=True)
-        if self.options["require_trace"] and receipt:
+        self.budget.phase = "trace"
+        if self.options["trace"] and receipt:
             self.memo["required_state_diff"] = self.attempt(lambda: self.query("debug_traceTransaction", [ashex(tx["hash"]),
                     {"tracer":"prestateTracer", "tracerConfig":{"diffMode":True,"disableCode":True,"disableStorage":True}, "timeout":"10s"}]), "STATE_DIFF")
         internals = (self.attempt(lambda: self.internal_calls(ashex(tx["hash"])), "INTERNAL_CALLS") or {"status": "unavailable", "complete": False, "calls": []}) if receipt else {"status": "not_applicable", "complete": False, "calls": []}
+        self.budget.phase = "identity"
         sender = self.attempt(lambda: self.counterpart(tx.get("from")), "SENDER")
         counterpart = self.attempt(lambda: self.counterpart(tx.get("to")), "COUNTERPART")
         classification, risks = self.attempt(lambda: self.classify(decoded, tx.get("to"), bool(receipt["status"]) if receipt else None), "CLASSIFICATION") or ({"type": "unknown"}, [])
@@ -630,8 +731,12 @@ class Analyzer:
                 row["classification"], flags = typed
                 if row["path"] != []:
                     risks.extend({**flag, "call_path": row["path"]} for flag in flags)
-            row["amounts"] = self.attempt(lambda: self.input_amounts(row["decoded"], context), "INTERNAL_AMOUNTS") or []
+            row["amounts"] = self.attempt(lambda: self.input_amounts(row["decoded"], context, row.get("value_wei")), "INTERNAL_AMOUNTS") or []
+        self.memo["route_tokens"] = list(dict.fromkeys(a["token_address"] for a in amounts + [a for row in internals["calls"] for a in row.get("amounts",[])] if a.get("token_address") and a.get("binding",{}).get("kind") == "path"))
+        self.budget.phase = "block_balances"
         changes = self.attempt(lambda: self.balance_changes(tx, receipt, events), "BALANCE_CHANGES") or {"status": "unavailable"}
+        self.budget.reserve_requests = 0
+        self.budget.phase = "canonicality"
         if receipt:
             canonical_block = self.attempt(lambda: self.query("eth_getBlockByNumber", [hex(int(receipt["blockNumber"])), False]), "CANONICAL_BLOCK_CHECK")
             if canonical_block and ashex(canonical_block["hash"]) != ashex(receipt["blockHash"]):
@@ -665,4 +770,4 @@ class Analyzer:
                 "core_status": {"input": "complete" if input_complete else "partial", "events": "complete" if events_complete else "partial"},
                 "enhancements_missing": enhancements,
                 "capabilities": {"external_enabled": self.options["external"], "trace_enabled": self.options["trace"],
-                                 "requests_used": self.budget.requests}}
+                                 "requests_used": self.budget.requests, "requests_by_stage":dict(self.budget.by_stage)}}
