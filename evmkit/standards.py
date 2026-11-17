@@ -60,6 +60,10 @@ ERC4626 = ERC20 + [
     F("asset", outputs=[("asset", "address")]), F("totalAssets", outputs=[("assets", "uint256")]),
     F("convertToShares", [("assets", "uint256")], [("shares", "uint256")]),
     F("convertToAssets", [("shares", "uint256")], [("assets", "uint256")]),
+    F("maxRedeem",[("owner","address")],[("maxShares","uint256")]),
+    F("maxWithdraw",[("owner","address")],[("maxAssets","uint256")]),
+    F("previewRedeem",[("shares","uint256")],[("assets","uint256")]),
+    F("previewWithdraw",[("assets","uint256")],[("shares","uint256")]),
     F("deposit", [("assets", "uint256"), ("receiver", "address")], [("shares", "uint256")], "nonpayable"),
     F("mint", [("shares", "uint256"), ("receiver", "address")], [("assets", "uint256")], "nonpayable"),
     F("withdraw", [("assets", "uint256"), ("receiver", "address"), ("owner", "address")], [("shares", "uint256")], "nonpayable"),
@@ -108,10 +112,16 @@ UNISWAP_V3_POOL = V3_COMMON + [E("Swap", V3_SWAP)]
 PANCAKE_V3_POOL = V3_COMMON + [E("Swap", V3_SWAP + [("protocolFeesToken0", "uint128", False), ("protocolFeesToken1", "uint128", False)])]
 DELEGATION_MANAGER=[F("redeemDelegations",[("permissionContexts","bytes[]"),("modes","bytes32[]"),("executionCallDatas","bytes[]")],state="nonpayable")]
 ERC1271=[F("isValidSignature",[("hash","bytes32"),("signature","bytes")],[("magicValue","bytes4")])]
+GTOKEN=ERC20+[F("core",outputs=[("core","address")]),F("underlying",outputs=[("underlying","address")]),
+    F("totalBorrow",outputs=[("totalBorrow","uint256")]),F("exchangeRate",outputs=[("rate","uint256")]),F("getCash",outputs=[("cash","uint256")]),
+    F("supply",[("account","address"),("uAmount","uint256")],[("minted","uint256")],"payable"),
+    F("borrow",[("account","address"),("amount","uint256")],[("borrowed","uint256")],"nonpayable"),
+    F("redeemToken",[("redeemer","address"),("gAmount","uint256")],[("redeemed","uint256")],"nonpayable"),
+    F("redeemUnderlying",[("redeemer","address"),("uAmount","uint256")],[("redeemed","uint256")],"nonpayable")]
 PRESETS = {"erc20": ERC20, "erc721": ERC721, "erc1155": ERC1155, "weth": WETH, "erc4626": ERC4626,
            "uniswap_v2_router": V2_ROUTER, "dex_v2_pair": V2_PAIR,
            "uniswap_v3_pool": UNISWAP_V3_POOL, "pancake_v3_pool": PANCAKE_V3_POOL,
-           "delegation_manager":DELEGATION_MANAGER,"erc1271":ERC1271}
+           "delegation_manager":DELEGATION_MANAGER,"erc1271":ERC1271,"compound_gtoken":GTOKEN}
 
 
 def preset(name):
@@ -123,6 +133,9 @@ def entries(kind):
     import json
     groups = {}
     for standard, abi in PRESETS.items():
+        # Protocol-specific presets are explicit interface assertions, not automatic
+        # standard recognition that could shadow a verified custom contract ABI.
+        if standard=="compound_gtoken":continue
         for item in abi:
             if item["type"] != kind:
                 continue

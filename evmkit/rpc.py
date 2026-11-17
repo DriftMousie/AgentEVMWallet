@@ -9,6 +9,21 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from .common import ToolError, require
 
 
+def revert_bytes(raw,depth=0):
+    if depth>4:return None
+    if isinstance(raw,str):
+        from .common import hexdata
+        if raw.startswith("Reverted "):raw=raw[9:]
+        try:return hexdata(raw) if len(raw)<=131074 else None
+        except ToolError:return None
+    if isinstance(raw,dict):
+        for key,value in list(raw.items())[:20]:
+            if key in ("data","return","result","originalError") or isinstance(key,str) and len(key)==66 and key.startswith("0x"):
+                found=revert_bytes(value,depth+1)
+                if found is not None:return found
+    return None
+
+
 def optional_error_code(error):
     """Classify internally; never expose provider messages containing credentials."""
     code, message = error.get("code"), str(error.get("message", "")).lower()
@@ -20,6 +35,16 @@ def optional_error_code(error):
     if any(s in message for s in ("unknown tracer", "unsupported tracer", "tracer not found", "only support", "unrecognized tracer")) or code == -32602 and "tracer" in message:
         return "CAPABILITY_UNAVAILABLE"
     return "OPTIONAL_RPC_REJECTED"
+
+
+def optional_failure(error):
+    error=error if isinstance(error,dict) else {}
+    out={"error":optional_error_code(error)}
+    if error.get("code")==3 or "execution reverted" in str(error.get("message","")).lower():
+        out["rpc_error_kind"]="reverted"
+        raw=revert_bytes(error.get("data"))
+        if raw is not None:out["revert_data"]=raw
+    return out
 
 
 class RPC:
@@ -37,6 +62,7 @@ class RPC:
     def read(self, fn):
         mismatch = False
         last_not_found = False
+        rejected = None
         for _ in range(2):
             for _, client in self.clients:
                 try:
@@ -52,13 +78,21 @@ class RPC:
                     # Never echo RPC exceptions: providers may include URLs, requests or credentials.
                     response = getattr(exc, "rpc_response", None)
                     error = response.get("error", {}) if isinstance(response, dict) else {}
-                    if isinstance(error, dict) and error.get("code") in (-32005, -32002, -32603, 429):
+                    if not error and exc.args and isinstance(exc.args[0],dict):error=exc.args[0]
+                    error=error if isinstance(error,dict) else {}
+                    message=str(error.get("message",str(exc))).lower()
+                    reverted=isinstance(exc,ContractLogicError) or error.get("code")==3 or "execution reverted" in message
+                    if not reverted and (error.get("code") in (-32005, -32002, -32603, 429) or any(t in message for t in ("rate limit","too many requests","timeout","timed out"))):
+                        continue
+                    if not reverted:
+                        rejected={"rpc_error_code":error.get("code") if isinstance(error.get("code"),int) else None}
                         continue
                     raw = getattr(exc, "data", None)
                     if raw is None and isinstance(error, dict):
                         raw = error.get("data")
                     details = None
-                    if isinstance(raw, str):
+                    raw=revert_bytes(raw)
+                    if raw is not None:
                         from .common import hexdata
                         try:
                             details = {"revert_data": hexdata(raw)}
@@ -66,10 +100,12 @@ class RPC:
                             details.update(decode_revert(raw))
                         except ToolError:
                             pass
-                    raise ToolError("CALL_REVERTED", "RPC rejected the call or contract execution reverted", data=details) from None
+                    raise ToolError("CALL_REVERTED", "EVM read execution reverted", data=details) from None
                 except Exception:
                     continue
             time.sleep(0.1)
+        if rejected is not None:
+            raise ToolError("RPC_REQUEST_REJECTED", "RPC rejected a read request; no contract execution failure has been established", data=rejected)
         if last_not_found:
             raise ToolError("NOT_FOUND", "Transaction or receipt not found", retryable=True)
         raise ToolError("CHAIN_ID_MISMATCH" if mismatch else "RPC_UNAVAILABLE",
@@ -77,7 +113,9 @@ class RPC:
 
     def send(self, raw):
         # Pick a validated endpoint without accidentally retrying a write.
-        self.read(lambda w: w.eth.block_number)
+        try:self.read(lambda w: w.eth.block_number)
+        except ToolError as exc:
+            raise ToolError(exc.code,exc.message,retryable=exc.retryable,data={"broadcast_attempted":False}) from None
         try:
             return self.active.eth.send_raw_transaction(raw)
         except Exception:
@@ -90,6 +128,7 @@ class RPC:
         require(method in allowed, "Analysis RPC method is not read-only", "INVALID_INPUT")
         from .network import json_request
         last_code = "SOURCE_UNAVAILABLE"
+        last_details = None
         for name, client in self.clients:
             if rpc_name is not None and name != rpc_name: continue
             try:
@@ -102,6 +141,7 @@ class RPC:
                                             payload={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []})
                     if response.get("error"):
                         last_code = optional_error_code(response["error"])
+                        last_details = None
                         continue
                     require(int(response.get("result", "0x0"), 16) == self.chain["chain_id"],
                             "Analysis RPC Chain ID mismatch", "CHAIN_ID_MISMATCH")
@@ -112,15 +152,18 @@ class RPC:
                                         payload={"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
                 if response.get("error"):
                     last_code = optional_error_code(response["error"])
+                    last_details = optional_failure(response["error"])
                     continue
                 require("result" in response and response["result"] is not None, "Optional RPC returned no result", "SOURCE_NOT_FOUND")
                 return response["result"]
             except ToolError as exc:
                 if exc.code == "ANALYSIS_LIMIT": raise
                 last_code = exc.code
+                last_details = exc.data if isinstance(exc.data,dict) else None
             except Exception:
                 last_code = "SOURCE_UNAVAILABLE"
-        raise ToolError(last_code, "Optional RPC capability unavailable; base transaction data is preserved")
+                last_details = None
+        raise ToolError(last_code, "Optional RPC capability unavailable; base transaction data is preserved",data=last_details)
 
     def optional_batch(self, calls, budget):
         """At most 20 independent eth_call operations; no Multicall semantics."""
@@ -143,7 +186,7 @@ class RPC:
                 require(isinstance(response,list) and len(response)==len(calls), "RPC batch unsupported", "CAPABILITY_UNAVAILABLE")
                 by_id = {row.get("id"):row for row in response if isinstance(row,dict)}
                 require(set(by_id)==set(range(len(calls))), "Invalid batch response IDs", "INVALID_RESPONSE")
-                return [{"error":optional_error_code(by_id[i]["error"])} if by_id[i].get("error") else
+                return [optional_failure(by_id[i]["error"]) if by_id[i].get("error") else
                         {"result":by_id[i]["result"]} if by_id[i].get("result") is not None else {"error":"SOURCE_NOT_FOUND"}
                         for i in range(len(calls))]
             except ToolError as exc:
@@ -158,7 +201,7 @@ class RPC:
         for method, params in calls:
             try: results.append({"result":self.optional_request(method,params,budget)})
             except ToolError as exc:
-                results.append({"error":exc.code})
+                results.append({"error":exc.code,**(exc.data if isinstance(exc.data,dict) else {})})
                 if exc.code == "ANALYSIS_LIMIT":
                     results.extend({"error":exc.code} for _ in range(len(calls)-len(results))); break
         return results

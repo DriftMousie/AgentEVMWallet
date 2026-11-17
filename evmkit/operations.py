@@ -17,6 +17,8 @@ from .rpc import RPC
 WRITE = {"execute", "gas", "gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "skip_simulation", "reason", "wait", "timeout", "confirmations"}
 BASE = {"chain", "wallet"}
 ANALYSIS = {"external", "trace", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses", "no_cache"}
+CONTRACT_DISCOVERY={"chain","block","external","no_cache","time_budget_seconds","max_requests","max_proxy_depth","max_nodes"}
+CONTRACT_INSPECTION=CONTRACT_DISCOVERY|{"address","account","functions","auto","view","include_source","no_semantics","max_probes","max_source_files"}
 # This registry drives both the Python API and the CLI, including unknown-field rejection.
 OPS = {
     "chain": {"list": set(), "health": {"chain"}, "block": {"chain", "block"}, "fees": {"chain"},
@@ -29,13 +31,16 @@ OPS = {
                     "wait": {"chain", "hash", "confirmations", "timeout"},
                     "decode": {"chain", "hash", "abi", "signature"} | ANALYSIS,
                     "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses", "require_trace", "focus_address", "view", "include_inputs"} | ANALYSIS,
-                    "plan": {"chain","hash","wallet","abi","signature","override","field_map","take_call","gas","gas_price_wei","max_fee_per_gas_wei","max_priority_fee_per_gas_wei"} | ANALYSIS,
+                    "plan": {"chain","hash","wallet","abi","signature","override","field_map","take_call","take_candidate","include_inputs","gas","gas_price_wei","max_fee_per_gas_wei","max_priority_fee_per_gas_wei"} | ANALYSIS,
                     "export-template": {"chain", "hash", "abi", "signature", "output"} | ANALYSIS,
                     "accelerate": BASE | WRITE | {"hash"}, "cancel": BASE | WRITE | {"hash"},
                     "replay": BASE | {"hash", "execute", "wait", "confirmations", "timeout"}},
-    "contract": {"functions": {"abi"}, "encode": {"abi", "function", "args"},
+    "contract": {"functions": {"abi","contract"}|CONTRACT_DISCOVERY, "encode": {"abi", "function", "args","contract"}|CONTRACT_DISCOVERY,
+                 "selector":{"signature"},
+                 "introspect":CONTRACT_INSPECTION,
+                 "diagnose":CONTRACT_INSPECTION|{"amount","amount_raw","amount_unit","pattern"},
                  "decode": {"abi", "data"},
-                 "call": BASE | {"contract", "abi", "function", "args", "address", "block", "value_wei"},
+                 "call": BASE | {"contract", "abi", "function", "args", "address", "block", "value_wei"}|CONTRACT_DISCOVERY,
                  "write": BASE | WRITE | {"contract", "abi", "function", "args", "value_wei"}},
     "transfer": {"native": BASE | WRITE | {"to", "amount", "amount_raw"},
                  "erc20": BASE | WRITE | {"to", "token", "amount", "amount_raw", "decimals"}},
@@ -112,7 +117,23 @@ class Toolkit:
         return uint(p["decimals"]) if p.get("decimals") is not None else self.call(p, p["token"], "decimals()", [], ["uint8"])
 
     def run(self, module, operation, params):
-        response=self._run(module,operation,params)
+        from .execution import execution_records,preserve_records
+        parent_records=execution_records.get()
+        records=[];token=execution_records.set(records)
+        try:response=preserve_records(self._run(module,operation,params),records)
+        finally:
+            execution_records.reset(token)
+            if parent_records is not None:parent_records.extend(records)
+        if isinstance(params,dict) and params.get("execute") is True and response.get("error") and not records and response.get("wallet") and response.get("chain_id"):
+            # Pre-engine validation may fail before any nonce baseline was captured.
+            payload=dict(response.get("data") or {})
+            payload.update(hash=None,status="not_broadcast",broadcast_attempted=False,phase="preflight")
+            try:
+                _,rpc=self.rpc(params);sender=response["wallet"]["address"]
+                current=rpc.read(lambda w:w.eth.get_transaction_count(sender,"pending"))
+                payload["nonce_check"]={"status":"no_baseline","before":None,"after":current,"changed":None,"proves_this_transaction_was_broadcast":False}
+            except Exception:payload["nonce_check"]={"status":"unavailable","proves_this_transaction_was_broadcast":False}
+            response["data"]=jsonable(payload)
         from .agent_output import suggested_next,summary_envelope
         if module=="transaction" and operation=="analyze" and response.get("ok"):
             from .calldata import refresh_timing,input_fields
@@ -127,6 +148,9 @@ class Toolkit:
             response["error"]["suggested_next"]=suggested_next(params,response.get("data"),response["error"]["code"])
         if module=="transaction" and operation=="analyze" and isinstance(params,dict) and params.get("view")=="summary":
             return summary_envelope(response)
+        if module=="contract" and operation in ("introspect","diagnose") and isinstance(params,dict) and params.get("view","summary")=="summary":
+            from .introspect import summary_envelope as contract_summary
+            return contract_summary(response)
         return response
 
     def _run(self, module, operation, params):
@@ -137,7 +161,7 @@ class Toolkit:
             require(module in OPS and operation in OPS[module], "Unknown operation")
             require(isinstance(params, dict), "params must be an object")
             require(not (set(params) - OPS[module][operation]), "Unknown operation parameters")
-            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache", "include_inputs", "verify"):
+            for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache", "include_inputs", "verify","auto","no_semantics","include_source"):
                 if key in params: require(isinstance(params[key], bool), f"{key} must be boolean")
             if params.get("chain"):
                 chain_id = self.config.chain(params["chain"])["chain_id"]
@@ -274,10 +298,15 @@ class Toolkit:
 
     def transaction_wait(self, p):
         chain, rpc = self.rpc(p)
-        receipt = wait_receipt(rpc, txhash(p["hash"]), p.get("confirmations", chain["confirmations"]), p.get("timeout", 120))
+        hash_=txhash(p["hash"])
+        receipt = wait_receipt(rpc, hash_, p.get("confirmations", chain["confirmations"]), p.get("timeout", 120))
+        from .engine import minted_nfts
+        out={**dict(receipt),"hash":hash_,"receipt":receipt,"status":"confirmed" if receipt["status"]==1 else "reverted","minted_nfts":minted_nfts(receipt) if receipt["status"]==1 else []}
         if receipt["status"] != 1:
-            raise ToolError("TRANSACTION_FAILED", "Transaction reverted on chain", data={"receipt": receipt})
-        return receipt
+            from .engine import execution_revert_details
+            out.update(execution_revert_details(rpc,hash_))
+            raise ToolError("EXECUTION_REVERTED", "Canonical confirmed receipt reports execution failure", data=out)
+        return out
 
     def transaction_decode(self, p):
         inspected = self.transaction_inspect(p)
@@ -383,25 +412,58 @@ class Toolkit:
         return Engine(self.config, chain, rpc).replay(self.wallet(p), p["hash"], p)
 
     def contract_functions(self, p):
+        abi=self.contract_abi(p)
         return [{"signature": canonical(i), "state_mutability": i.get("stateMutability"), "inputs": i.get("inputs", []), "outputs": i.get("outputs", [])}
-                for i in load_abi(p["abi"]) if i.get("type") == "function"]
+                for i in abi if i.get("type") == "function"]
+
+    def contract_abi(self,p):
+        if p.get("abi") is not None:return load_abi(p["abi"])
+        require(p.get("contract") and p.get("chain"),"Provide explicit ABI, or chain and contract for automatic ABI discovery","ABI_REQUIRED")
+        from .introspect import discover_abi
+        return discover_abi(self,p)[0]
+
+    def contract_selector(self,p):
+        from .abi import selector
+        return {"signature":p["signature"],"selector":selector(p["signature"])}
+
+    def contract_introspect(self,p):
+        from .introspect import inspect_contract
+        chain,rpc=self.rpc(p)
+        return inspect_contract(self.config,chain,rpc,p)
+
+    def contract_diagnose(self,p):
+        from .introspect import inspect_contract
+        chain,rpc=self.rpc(p)
+        return inspect_contract(self.config,chain,rpc,p,diagnose=True)
 
     def contract_encode(self, p):
-        item = resolve(load_abi(p["abi"]), p["function"])
+        item = resolve(self.contract_abi(p), p["function"])
         return {"signature": canonical(item), "data": encode_call(canonical(item), p.get("args", []))}
 
     def contract_decode(self, p):
         return decode_call(p["data"], abi=load_abi(p["abi"]))
 
     def contract_call(self, p):
-        abi = read_abi(p.get("abi"), p["function"])
+        discovered=None
+        try:abi = read_abi(p.get("abi"), p["function"])
+        except ToolError as exc:
+            if exc.code!="ABI_REQUIRED":raise
+            from .introspect import discover_abi
+            abi,discovered=discover_abi(self,p)
         item = resolve(abi, p["function"])
+        if discovered:require(item.get("stateMutability") in ("view","pure"),"Automatic ABI calls are view/pure only; provide explicit ABI for a manually requested simulation","READ_ONLY_REQUIRED")
         data = encode_call(canonical(item), p.get("args", []))
         require(item.get("stateMutability") == "payable" or uint(p.get("value_wei", "0")) == 0, "Nonpayable function cannot receive value")
         _, rpc = self.rpc(p)
-        require(rpc.read(lambda w: w.eth.get_code(address(p["contract"]), block_id(p.get("block", "latest")))), "Address has no contract code at selected block", "NO_CONTRACT")
         call = {"to": address(p["contract"]), "data": data, "value": uint(p.get("value_wei", "0"))}
         if p.get("address") or p.get("wallet"): call["from"] = self.owner(p)
+        if discovered:
+            discovered.account=call.get("from")
+            row=discovered.read(p["contract"],canonical(item),p.get("args",[]))
+            if row.get("status")!="success":raise ToolError("CONTRACT_READ_FAILED","Discovered ABI view call failed",data={"probe":row,"structure":discovered.structure(p["contract"]),"block":{"number":str(int(discovered.block,16)),"hash":discovered.block_hash}})
+            discovered.canonical_check();require(discovered.canonicality=="verified","Pinned block could not be rechecked","CANONICALITY_UNAVAILABLE")
+            return {"return_data":row["raw"],"values":row["values"],"block":{"number":str(int(discovered.block,16)),"hash":discovered.block_hash},"abi_source":discovered.structure(p["contract"])["effective_abi_source"]}
+        require(rpc.read(lambda w: w.eth.get_code(address(p["contract"]), block_id(p.get("block", "latest")))), "Address has no contract code at selected block", "NO_CONTRACT")
         output = rpc.read(lambda w: w.eth.call(call, block_id(p.get("block", "latest"))))
         from eth_utils.abi import collapse_if_tuple
         types = [collapse_if_tuple(o) for o in item.get("outputs", [])]
@@ -546,7 +608,9 @@ class Toolkit:
             out["verification"].update(status="success",return_data=jsonable(returned))
         except ToolError as exc:
             out["status"]="blocked";out["verification"].update(status="failed",reason=exc.code,details=exc.data)
-            raise ToolError(exc.code,exc.message,retryable=exc.retryable,data=out) from None
+            code="SIMULATION_REVERTED" if exc.code=="CALL_REVERTED" else exc.code
+            out["verification"]["reason"]=code
+            raise ToolError(code,exc.message,retryable=exc.retryable,data=out) from None
         return out
 
     def raw_decode(self, p):
@@ -655,7 +719,7 @@ class Toolkit:
             query = {"address": target, "fromBlock": start, "toBlock": stop, "topics": topics}
             try: rows = rpc.read(lambda w: w.eth.get_logs(query))
             except ToolError as exc:
-                if size > 1 and exc.code in ("RPC_UNAVAILABLE", "CALL_REVERTED"):
+                if size > 1 and exc.code in ("RPC_UNAVAILABLE", "RPC_REQUEST_REJECTED"):
                     size = max(1, size // 2)
                     continue
                 raise ToolError("LOG_QUERY_INCOMPLETE", "Event query did not complete", retryable=True,
@@ -717,7 +781,7 @@ class Toolkit:
             rows.append({"id": item["id"], "status": "completed" if response["ok"] else "failed", "result": response})
             if not response["ok"]:
                 any_failed = True
-                if response["error"]["code"] in ("BROADCAST_UNKNOWN", "CONFIRMATION_TIMEOUT", "RPC_UNAVAILABLE") and lane:
+                if (response["error"]["code"] in ("BROADCAST_UNKNOWN", "CONFIRMATION_TIMEOUT", "CONFIRMATION_UNAVAILABLE", "RPC_UNAVAILABLE") or (response.get("data") or {}).get("status") in ("broadcast_unknown","broadcast_unconfirmed")) and lane:
                     uncertain.add(lane)
                 stopped = not p.get("continue_on_error", False)
         out = {"items": rows, "status": "partial_failure" if any_failed else "completed"}

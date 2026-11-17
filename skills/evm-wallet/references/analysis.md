@@ -322,9 +322,11 @@ python transaction.py plan --describe
 python address.py history --describe
 python address.py actions --describe
 python raw.py patch --describe
+python contract.py introspect --describe
+python contract.py diagnose --describe
 ```
 
-这五项机器帮助不读取配置、不加载私钥、不联网，输出用途/禁用场景、JSON 参数 schema、必填/默认值、稳定字段和成本影响因素。chain 仍必须显式提供；耗时和请求量是条件相关估计，不承诺固定 3–8 秒。
+这七项机器帮助不读取配置、不加载私钥、不联网，输出用途/禁用场景、JSON 参数 schema、必填/默认值、稳定字段和成本影响因素。chain 仍必须显式提供；耗时和请求量是条件相关估计，不承诺固定 3–8 秒。
 
 ## 地址历史与 actions
 
@@ -377,9 +379,9 @@ python transaction.py analyze --chain sepolia --hash "$TX_HASH" --view full --in
 
 single CALL 的 executionCalldata 按 20 字节 target、32 字节 value、后续 calldata 读取，不扫描任意字节找 selector。这些结果放 declared_calls，source=encoded_execution、execution_index 从 0 开始、execution_observed=false、committed=null、path=null，不与真实 internal_calls 或 fund_flows 合并。其他模式/不完整 payload 标为 unsupported/partial，不按同一布局猜读。[ERC-7579 执行编码](https://eips.ethereum.org/EIPS/eip-7579)、[DelegationManager 接口](https://github.com/MetaMask/delegation-framework/blob/main/src/interfaces/IDelegationManager.sol)
 
-外层已知管理器的 plan 返回 CONTEXT_DEPENDENT_CALL，保留候选模板，提示选择业务调用。不能因为 outer eth_call 未 revert 就认为普通钱包复现了原授权流程；本版不创建授权、不重新签名。
+外层已知管理器不再作为 plan 模板：完整且唯一的合格业务候选自动生成内层预览并模拟；多个/不完整/无合格候选返回 CONTEXT_DEPENDENT_CALL、template=null 和候选，要求显式选择。不能因为 outer eth_call 未 revert 就认为普通钱包复现了原授权流程；本版不创建授权、不重新签名。
 
-## take-call：选择实际或声明的业务 CALL
+## take-call / take-candidate：选择实际或声明的业务 CALL
 
 ```bash
 python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading \
@@ -387,7 +389,12 @@ python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading \
   --override '{"recipient":"self","deadline":"now+1800"}'
 python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading --take-call 'path:0.1.2'
 python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading --take-call 'execution:0'
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading --take-candidate 0 --include-inputs
 ```
+
+--take-candidate N 使用本次显示的 candidate_index（零基），与 --take-call 互斥。已知管理器优先按声明 execution_index 形成候选，不因 trace 可用性变化而重排；其他完整 trace 候选按路径顺序形成，只含普通已生效、输入完整的非预编译内部 CALL。声明不完整时禁止自动接管，但可显式选择已取得的受支持执行项。
+
+--include-inputs 同样适用于 plan，为 candidates/source_call 附 input_raw；输入不截断，默认不返回该字段。模板 data 始终完整。多候选 template=null；单候选后遇到 ABI_REQUIRED、参数冲突、解码或模拟失败，仍保留原始内层模板和候选，而非退回外层。
 
 完整地址:selector 在完整 callTracer 中匹配；多个结果返回候选，不取第一条。trace 截断时必须指定已知 path；无 trace 时仅可从完整的已知协议声明匹配，亦可显式 execution:N。path 是根 [] 下的零基数组路径，execution:N 是声明索引，二者不能互冒。
 
@@ -410,6 +417,23 @@ recipient=self 或完整地址，deadline=整数秒或 now+正整数。可靠 AB
 
 映射只支持 selector 后完整 word，两个字段不能重叠，不支持 packed 或动态偏移猜测。确认 ABI 编辑与原始映射二选一；映射不提升 template_safe，始终 payload_unverified=true，当前模拟失败仍保留模板和 word diff。直接改动有效期可能破坏签名覆盖，工具不会补签。
 
+## NFT 参数与 contract-assigned ID
+
+明确 override.tokenId 仅改可靠 ABI 中唯一 tokenId/token_id（可嵌套、忽略名字前导下划线）的无符号字段；歧义或与 args 同时覆盖拒绝。常见 ERC-721 操作尽力在 pending 查询 ownerOf，并在 nft_context 标注 matches_wallet/different_owner/unavailable；不同归属不等于一定无权操作，最终还需模拟授权路径。
+
+"tokenId":"auto" 仅用于显式/已确认接口中的 createLock(uint256,uint256)、create_lock(uint256,uint256) 及对应 For(uint256,uint256,address)，且接口不含 tokenId 入参。不传旧 NFT ID、不读取计数器猜 ID；nft_context.expected_token_id=null，实际 ID 只能从成功回执 minted_nfts 确认。仅 selector/4byte 猜测不够，其他函数或已有 NFT 操作报 TOKEN_ID_AUTO_UNSUPPORTED。用户显式 ABI/signature 仍是用户接口断言，并不提升为源码验证。
+
+```bash
+# 仅在已确认该合约接口后使用；第二参数的锁仓单位须先核实
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --wallet trading \
+  --take-candidate 0 --signature 'createLock(uint256,uint256)' \
+  --override '{"tokenId":"auto","recipient":"self"}' --include-inputs
+```
+
+amount 简写在这些已确认创建接口中对应第一个 uint256。两参数版本以模拟钱包作为 caller-owned 接口收件人，不新增 calldata 字段；For 版本改写第三个地址参数。不能把两参数版本改成任意收件人。缺少交易 deadline 的接口拒绝 deadline 别名，不把锁仓时长/解锁时间当 now+1800；锁仓参数使用明确 args 和已核实单位。
+
+本轮公开 veNFT 样本 selector 与 createLock 两参数签名匹配，原 NFT 编号来自 mint 日志。公开 Sourcify 仅验证了代理，未提供实现 ABI；该结果不证明第二参数单位或具体业务语义，不把旧 ID 当作输入、不硬编码该项目地址和实现。
+
 ## timing：过期参数不静默复用
 
 分析输出 timing.reference_timestamp、clock_source、fields[]；每项包含 field_path/name/raw/type、deadline、expired、expires_in_s、unit、semantic_source/confidence。秒数以整数串保留；field_path 为嵌套参数索引数组。
@@ -424,6 +448,8 @@ recipient=self 或完整地址，deadline=整数秒或 now+正整数。可靠 AB
 python raw.py patch --chain sepolia --to "$CONTRACT" --address "$OWNER" \
   --data "$CALLDATA" --word 6 --type address --value "$RECIPIENT" --verify
 python raw.py patch --describe
+python contract.py introspect --describe
+python contract.py diagnose --describe
 ```
 
 word 从 selector 后第一格的 0 开始，byte_offset=4+word×32。--type address 左补零到 32 字节；uint256 接受十进制整数或 hex 数量，检查范围；默认 bytes32 必须正好 32 字节，不能把 20 字节值暗自当地址。只替换已存在的完整 word，不改 selector、不插入/删除、不补齐半个尾部 word。
@@ -442,11 +468,23 @@ refunds 已包含在 tokens.in/net 或 native.received_wei/net_wei，不再扣�
 
 ## 本轮 Sepolia 只读验收
 
+四笔参考交互和一笔复现授权均通过新版 transaction.wait 返回 confirmed；此前误报的授权仍确认 gasUsed=128310。新版 plan 自动选中兑换与 veNFT 的唯一声明业务调用，分别完整交付 868/68 字节原始输入；当前公共 RPC 模拟均明确回退，保留内层模板、候选、实际模拟钱包和 SIMULATION_REVERTED，不把它们报告为已执行。veNFT 预览采用显式接口断言，expected_token_id 保持 null；原始成功回执可提取其 ERC-721 mint 编号。
+
+实链验收仅用临时观察钱包配置，禁用发送接口，未加载密钥。交易生命周期与候选/NFT 行为另用本地故障注入验证；测试脚本和真实样本明细不入仓库。
+
+## 上一轮 Sepolia 只读验收（旧行为记录）
+
 四笔公开样本均完成只读检查：委托外层能解包一条完整 676 字节的声明调用；它与直接兑换样本的 calldata 仅第 5、6 个 word 不同。两笔配套授权的 gasUsed 均为 128298。无 trace 时保留声明来源，未声称已验证真实第三层路径。
 
 兑换样本的回流精确保留为 40555791 raw，交易内 receipt_position=7，区块 log_index=74，标为 refund_candidate；该公共节点拒绝历史精度查询，故 amount_readable=null。缓存摘要实测 1580 字节，禁用网络后仍可命中并刷新时间提示。
 
-外层复现被 CONTEXT_DEPENDENT_CALL 拦截；内层显式映射生成了候选参数差异，但当前 eth_call 与 raw.patch 校验均返回 CALL_REVERTED，结果正确为 blocked。这证明失败数据交付与拦截路径有效，不代表当前状态可成功复现。全过程未签名、未广播；样本明细和临时测试不加入仓库。
+上一轮版本外层复现被 CONTEXT_DEPENDENT_CALL 拦截；内层显式映射生成了候选参数差异，但当前 eth_call 与 raw.patch 校验均返回 CALL_REVERTED，结果正确为 blocked。这证明失败数据交付与拦截路径有效，不代表当前状态可成功复现。全过程未签名、未广播；样本明细和临时测试不加入仓库。
+
+## 广播结果与错误解码
+
+执行结果规则见 [工具包故障处理](toolkit.md#交易执行与故障处理)。ok=false 不能直接解释为未发送或链上回退；广播后错误仍带 hash，确认故障先查原交易，避免重复业务。plan/raw.patch 的明确模拟回退使用 SIMULATION_REVERTED；RPC_REQUEST_REJECTED 不表示合约 revert。
+
+错误 bytes 通过本地标准/已有 ABI 解码，保留全部候选、命名参数、source/confidence 和原始数据。ERC20InsufficientAllowance 的三个参数为 spender、allowance、needed；Expired() 只是名称模式，不能单凭 selector 确定过期的是交易 deadline。没有原交易 trace 时链上失败原因保持未知，不用最新状态的 eth_call 冒充历史事实。
 
 ## 本地缓存与强制刷新
 
@@ -512,3 +550,8 @@ CSV 仍为 chain,name,url,priority,enabled 五列。示例新增默认禁用的 
 BSC 单跳样本实测：冷分析 9.51 秒，34 次增强 HTTP / 37 个逻辑 RPC 调用，metadata 覆盖 3 个地址、两种代币流量，4 条日志均解码。缓存摘要 1398 字节、约 0.001 秒，并通过阻断全部 RPC/HTTP 验证零网络；强制刷新约 9.01 秒。
 
 本次公共节点未提供可用 trace，历史读取返回鉴权/权限拒绝，历史余额 9 组均未完成，因此 native/fund_flows 为 partial，tokens_status 为 complete；不能沿用上一个版本同一节点曾成功的 9/9 结论。过期参考交易的实时 unsigned plan 被模拟拒绝，模板和 diff 仍保留，无签名/广播。公共 Base Blockscout 历史请求返回鉴权错误，因此本轮不声称该公共服务可免 Key 使用；分页/空历史/限流/聚合等通过离线适配器回归验证。
+
+
+## 合约地址分析的分工
+
+给交易 hash 仍使用 transaction.analyze；给合约地址、需要展开代理/状态/源码线索或检查退出前提时，使用 contract.introspect / contract.diagnose。两者不替换资金流分析，也不自动接管广播。详见 [合约分析参考](introspect.md)，新增机器帮助与默认 summary 的边界在该文档中说明。

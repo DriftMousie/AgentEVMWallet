@@ -10,6 +10,7 @@ from contextlib import contextmanager, nullcontext
 from web3 import Web3
 
 from .common import ToolError, require, uint, address, hexdata, txhash, jsonable, formatted
+from .execution import guarded_execution
 
 
 class Journal:
@@ -97,124 +98,198 @@ def fee_summary(transaction):
     }
 
 
-def wait_receipt(rpc, hash_, confirmations=1, timeout=120):
+def wait_options(confirmations, timeout):
     confirmations, timeout = uint(confirmations), uint(timeout)
     require(confirmations >= 1, "Confirmations must be at least one")
-    deadline = time.monotonic() + timeout
+    require(timeout > 0, "Confirmation timeout must be positive")
+    return confirmations, timeout
+
+
+def minted_nfts(receipt):
+    """Receipt-reported ERC-721 mint IDs; not a prediction of future IDs."""
+    result=[]
+    topic=Web3.keccak(text="Transfer(address,address,uint256)")
+    logs=receipt.get("logs",[])
+    if not isinstance(logs,(list,tuple)):return result
+    for position,row in enumerate(logs):
+        try:
+            raw_topics=row.get("topics",[])
+            if not isinstance(raw_topics,(list,tuple)) or len(raw_topics)!=4:continue
+            if any(not isinstance(t,(str,bytes,bytearray)) or len(t)!=(66 if isinstance(t,str) else 32) for t in raw_topics):continue
+            topics=[bytes.fromhex(t[2:]) if isinstance(t,str) else bytes(t) for t in raw_topics]
+            if len(topics)!=4 or topics[0]!=topic or topics[1]!=bytes(32) or any(len(t)!=32 for t in topics):continue
+            data=row.get("data",b"")
+            if data not in (b"","0x") or topics[2][:12]!=bytes(12):continue
+            result.append({"address":address(row["address"]),"recipient":address("0x"+topics[2][-20:].hex()),
+                           "token_id":str(int.from_bytes(topics[3],"big")),"receipt_position":position,"source":"receipt.ERC721_Transfer_from_zero"})
+        except Exception:continue
+    return result
+
+
+def execution_revert_details(rpc,hash_):
+    """Best-effort exact transaction trace; never substitute a later eth_call."""
+    try:
+        from .network import Budget
+        from .abi import decode_revert
+        trace=rpc.optional_request("debug_traceTransaction",[hash_,{"tracer":"callTracer","tracerConfig":{"onlyTopCall":True},"timeout":"2s"}],Budget(seconds=3,requests_limit=2))
+        raw=trace.get("output") if isinstance(trace,dict) else None
+        if isinstance(raw,str) and len(raw)<=131074:
+            return {**decode_revert(raw),"revert_details_status":"available","revert_source":"debug_traceTransaction.callTracer"}
+    except Exception:pass
+    return {"revert_details_status":"unavailable"}
+
+
+def wait_receipt(rpc, hash_, confirmations=1, timeout=120):
+    hash_=txhash(hash_)
+    confirmations, timeout = wait_options(confirmations, timeout)
+    deadline=time.monotonic()+timeout
+    progress={"hash":hash_, "status":"broadcast_unconfirmed", "receipt":None,
+              "confirmations":0, "required_confirmations":confirmations, "phase":"confirmation"}
     while True:
         try:
-            receipt = rpc.read(lambda w: w.eth.get_transaction_receipt(hash_))
-            # Check canonical block hash each poll, rather than counting a stale receipt.
-            canonical = rpc.read(lambda w: w.eth.get_block(receipt["blockNumber"]))
-            height = rpc.read(lambda w: w.eth.block_number)
-            if canonical["hash"] == receipt["blockHash"] and height - receipt["blockNumber"] + 1 >= confirmations:
-                return receipt
+            receipt=rpc.read(lambda w:w.eth.get_transaction_receipt(hash_))
+            progress.update(receipt=receipt, confirmations=0, canonicality="unchecked")
+            canonical=rpc.read(lambda w:w.eth.get_block(receipt["blockNumber"]))
+            if canonical["hash"]==receipt["blockHash"]:
+                progress["canonicality"]="verified"
+                height=rpc.read(lambda w:w.eth.block_number)
+                progress["confirmations"]=max(0,height-receipt["blockNumber"]+1)
+                if progress["confirmations"]>=confirmations:
+                    require(receipt.get("status") in (0,1), "Receipt has no supported execution status", "INVALID_RESPONSE")
+                    return receipt
+            else:
+                progress["canonicality"]="reorged"
         except ToolError as exc:
-            if exc.code != "NOT_FOUND": raise
-        if time.monotonic() >= deadline:
-            raise ToolError("CONFIRMATION_TIMEOUT", "Transaction not confirmed before timeout", data={"hash": hash_, "status": "unconfirmed"})
-        time.sleep(0.5)
+            if exc.code!="NOT_FOUND":
+                progress["confirmation_error"]={"code":exc.code}
+                raise ToolError("CONFIRMATION_UNAVAILABLE", "Receipt/canonical block confirmation query unavailable; transaction is not classified as reverted", retryable=True, data=progress) from None
+            # A previous observation may now be missing; retain it but invalidate it.
+            progress.update(confirmations=0, canonicality="receipt_unavailable")
+        except Exception:
+            raise ToolError("CONFIRMATION_UNAVAILABLE", "Confirmation response could not be checked", retryable=True, data=progress) from None
+        if time.monotonic()>=deadline:
+            raise ToolError("CONFIRMATION_TIMEOUT", "Transaction has not reached the requested confirmations", retryable=True, data=progress)
+        time.sleep(min(0.5,max(0,deadline-time.monotonic())))
 
 
 class Engine:
     def __init__(self, config, chain, rpc):
         self.config, self.chain, self.rpc = config, chain, rpc
 
-    def send(self, wallet, to, value, data, params, *, erc20=False, replacement=False):
-        to, value, data = address(to), uint(value, "value"), hexdata(data)
-        execute = params.get("execute", False)
-        require(isinstance(execute, bool), "execute must be boolean")
-        if execute:
-            require(wallet["account"] is not None, "Watch-only wallet cannot sign", "WALLET_ERROR")
-        skip = params.get("skip_simulation", False)
-        if skip:
-            require(params.get("gas") is not None and isinstance(params.get("reason"), str) and params["reason"].strip(), "Skipping simulation requires gas and a reason")
-        sender, chain_id = wallet["address"], self.chain["chain_id"]
-        journal = Journal(self.config.state_dir) if execute else None
-        with journal.lock(chain_id, sender) if journal else nullcontext():
+    def _journal_status(self, journal, context, state, output):
+        try:journal.status(context["hash"],state)
+        except Exception:
+            output.setdefault("warnings",[]).append("JOURNAL_UPDATE_FAILED: transaction hash and chain outcome are preserved; inspect the original hash before sending again")
+
+    def _wait(self, context, journal, output, params):
+        context["phase"]="confirmation"
+        try:
+            receipt=wait_receipt(self.rpc,context["hash"],params.get("confirmations",self.chain["confirmations"]),params.get("timeout",120))
+        except ToolError as exc:
+            if isinstance(exc.data,dict):context.update(exc.data)
+            raise ToolError(exc.code,exc.message,retryable=exc.retryable,data={**output,**(exc.data or {})}) from None
+        context.update(receipt=receipt,status="confirmed" if receipt["status"]==1 else "reverted",phase="complete")
+        output.update(context)
+        if receipt["status"]==1:output["minted_nfts"]=minted_nfts(receipt)
+        self._journal_status(journal,context,"confirmed" if receipt["status"]==1 else "failed",output)
+        if receipt["status"]==0:
+            output.update(execution_revert_details(self.rpc,context["hash"]))
+            raise ToolError("EXECUTION_REVERTED", "Canonical confirmed receipt reports execution failure",data=output)
+        return output
+
+    def _broadcast(self, signed, context, journal, output):
+        context.update(phase="broadcast",broadcast_attempted=True,status="broadcast_unknown")
+        try:
+            returned=self.rpc.send(signed.raw_transaction)
+            require(Web3.to_hex(returned).lower()==context["hash"].lower(), "RPC returned an unexpected transaction hash", "BROADCAST_UNKNOWN")
+        except Exception as exc:
+            if isinstance(exc,ToolError) and isinstance(exc.data,dict) and exc.data.get("broadcast_attempted") is False:
+                context.update(broadcast_attempted=False,status="signed_not_broadcast")
+                raise ToolError(exc.code,exc.message,retryable=exc.retryable,data=output) from None
+            self._journal_status(journal,context,"unknown",output)
+            raise ToolError("BROADCAST_UNKNOWN", "Broadcast outcome unknown; query the original hash before explicitly replaying it",data=output) from None
+        context.update(status="broadcast_unconfirmed",phase="broadcast_acknowledged")
+        output.update(context)
+        self._journal_status(journal,context,"broadcast",output)
+
+    @guarded_execution
+    def send(self, wallet, to, value, data, params, *, erc20=False, replacement=False, context):
+        to,value,data=address(to),uint(value,"value"),hexdata(data)
+        execute=params.get("execute",False)
+        require(isinstance(execute,bool),"execute must be boolean")
+        if params.get("wait"):wait_options(params.get("confirmations",self.chain["confirmations"]),params.get("timeout",120))
+        if execute:require(wallet["account"] is not None,"Watch-only wallet cannot sign","WALLET_ERROR")
+        skip=params.get("skip_simulation",False)
+        if skip:require(params.get("gas") is not None and isinstance(params.get("reason"),str) and params["reason"].strip(),"Skipping simulation requires gas and a reason")
+        sender,chain_id=wallet["address"],self.chain["chain_id"]
+        journal=Journal(self.config.state_dir) if execute else None
+        with journal.lock(chain_id,sender) if journal else nullcontext():
             if journal:
-                for hash_, nonce in journal.unresolved(chain_id, sender):
-                    try:
-                        self.rpc.read(lambda w: w.eth.get_transaction(hash_))
-                        journal.status(hash_, "broadcast")
+                for previous,nonce in journal.unresolved(chain_id,sender):
+                    try:self.rpc.read(lambda w:w.eth.get_transaction(previous))
                     except ToolError:
-                        raise ToolError("BROADCAST_UNKNOWN", "Resolve or replay previous uncertain transaction before sending", data={"hash": hash_}) from None
-            pending = self.rpc.read(lambda w: w.eth.get_transaction_count(sender, "pending"))
-            if replacement:
-                nonce = uint(params["nonce"], "nonce")
+                        raise ToolError("BROADCAST_UNKNOWN","Resolve the previous uncertain transaction before sending",data={"previous_hash":previous}) from None
+                    journal.status(previous,"broadcast")
+            context["phase"]="nonce"
+            pending=self.rpc.read(lambda w:w.eth.get_transaction_count(sender,"pending"))
+            context["pending_nonce_before"]=pending
+            if replacement:nonce=uint(params["nonce"],"nonce")
             else:
-                require(params.get("nonce") is None, "Manual Nonce is only available for replacement operations")
-                nonce = journal.next_nonce(chain_id, sender, pending) if journal else pending
-            tx = {"chainId": chain_id, "from": sender, "to": to, "value": value, "data": data, "nonce": nonce}
-            tx.update(fees(self.rpc, self.chain, params))
-            simulation = {"status": "skipped", "reason": params.get("reason")} if skip else {}
-            call_tx = {k: v for k, v in tx.items() if k not in ("nonce", "chainId", "type")}
+                require(params.get("nonce") is None,"Manual Nonce is only available for replacement operations")
+                nonce=journal.next_nonce(chain_id,sender,pending) if journal else pending
+            context["nonce"]=nonce
+            tx={"chainId":chain_id,"from":sender,"to":to,"value":value,"data":data,"nonce":nonce}
+            context["phase"]="fees";tx.update(fees(self.rpc,self.chain,params))
+            simulation={"status":"skipped","reason":params.get("reason")} if skip else {}
+            call_tx={k:v for k,v in tx.items() if k not in ("nonce","chainId","type")}
             if not skip:
-                output = self.rpc.read(lambda w: w.eth.call(call_tx, "pending"))
-                if erc20 and output:
-                    require(len(output) == 32 and int.from_bytes(output, "big") == 1, "ERC-20 operation returned false or invalid data", "TOKEN_OPERATION_FAILED")
-                simulation = {"status": "success", "return_data": jsonable(output)}
-            gas = uint(params["gas"], "gas") if params.get("gas") is not None else (self.rpc.read(lambda w: w.eth.estimate_gas(call_tx)) * 120 + 99) // 100
-            require(gas > 0, "Gas must be positive")
-            tx["gas"] = gas
-            unit_fee = tx.get("maxFeePerGas", tx.get("gasPrice"))
-            balance = self.rpc.read(lambda w: w.eth.get_balance(sender, "pending"))
-            require(balance >= value + gas * unit_fee, "Insufficient native balance for value and execution fee cap", "INSUFFICIENT_BALANCE")
-            preview = {"transaction": tx, "fee_summary": fee_summary(tx), "simulation": simulation, "execution_fee_cap_wei": str(gas * unit_fee),
-                       "fee_scope": "EVM execution only; chain-specific L1/data fees are not included", "status": "preview"}
-            if not execute:
-                return preview
-            unsigned = {k: v for k, v in tx.items() if k != "from"}
-            signed = wallet["account"].sign_transaction(unsigned)
-            hash_ = Web3.to_hex(signed.hash)
-            journal.save(hash_, chain_id, sender, unsigned, "signed")
-            try:
-                returned = self.rpc.send(signed.raw_transaction)
-                require(Web3.to_hex(returned).lower() == hash_.lower(), "RPC returned an unexpected transaction hash", "BROADCAST_UNKNOWN")
-            except ToolError:
-                journal.status(hash_, "unknown")
-                raise ToolError("BROADCAST_UNKNOWN", "Broadcast outcome unknown; query or replay this exact hash", data={"hash": hash_, "status": "unknown"}) from None
-            journal.status(hash_, "broadcast")
-            preview.update(hash=hash_, status="broadcast")
-            if params.get("wait"):
-                receipt = wait_receipt(self.rpc, hash_, params.get("confirmations", self.chain["confirmations"]), params.get("timeout", 120))
-                journal.status(hash_, "confirmed" if receipt["status"] == 1 else "failed")
-                preview.update(receipt=receipt, status="confirmed" if receipt["status"] == 1 else "failed")
-                if receipt["status"] != 1:
-                    raise ToolError("TRANSACTION_FAILED", "Transaction reverted on chain", data=preview)
+                context["phase"]="simulation"
+                output=self.rpc.read(lambda w:w.eth.call(call_tx,"pending"))
+                if erc20 and output:require(len(output)==32 and int.from_bytes(output,"big")==1,"ERC-20 operation returned false or invalid data","TOKEN_OPERATION_FAILED")
+                simulation={"status":"success","return_data":jsonable(output)}
+            context["phase"]="gas_estimation"
+            gas=uint(params["gas"],"gas") if params.get("gas") is not None else (self.rpc.read(lambda w:w.eth.estimate_gas(call_tx))*120+99)//100
+            require(gas>0,"Gas must be positive");tx["gas"]=gas
+            context["phase"]="balance"
+            unit_fee=tx.get("maxFeePerGas",tx.get("gasPrice"))
+            balance=self.rpc.read(lambda w:w.eth.get_balance(sender,"pending"))
+            require(balance>=value+gas*unit_fee,"Insufficient native balance for value and execution fee cap","INSUFFICIENT_BALANCE")
+            preview={"transaction":tx,"fee_summary":fee_summary(tx),"simulation":simulation,"execution_fee_cap_wei":str(gas*unit_fee),
+                     "fee_scope":"EVM execution only; chain-specific L1/data fees are not included","status":"preview"}
+            if not execute:return preview
+            context["phase"]="signing"
+            unsigned={k:v for k,v in tx.items() if k!="from"}
+            signed=wallet["account"].sign_transaction(unsigned)
+            context.update(hash=Web3.to_hex(signed.hash),status="signed_not_broadcast",phase="journal_save")
+            try:journal.save(context["hash"],chain_id,sender,unsigned,"signed")
+            except Exception:raise ToolError("JOURNAL_SAVE_FAILED","Cannot durably record the signed transaction; broadcasting was not attempted") from None
+            self._broadcast(signed,context,journal,preview)
+            if params.get("wait"):return self._wait(context,journal,preview,params)
             return preview
 
-    def replay(self, wallet, hash_, params):
-        hash_ = txhash(hash_)
-        journal = Journal(self.config.state_dir)
-        record = journal.get(hash_)
-        require(record["chain_id"] == self.chain["chain_id"] and record["sender"] == wallet["address"], "Record does not match chain and wallet")
-        if not params.get("execute"):
-            return {"status": "preview", "hash": hash_, "transaction": record["tx"]}
-        require(wallet["account"], "Watch-only wallet cannot sign", "WALLET_ERROR")
-        with journal.lock(self.chain["chain_id"], wallet["address"]):
-            signed = wallet["account"].sign_transaction(record["tx"])
-            require(Web3.to_hex(signed.hash) == hash_, "Reconstructed transaction hash differs")
+    @guarded_execution
+    def replay(self, wallet, hash_, params, *, context):
+        hash_=txhash(hash_)
+        if params.get("wait"):wait_options(params.get("confirmations",self.chain["confirmations"]),params.get("timeout",120))
+        journal=Journal(self.config.state_dir);record=journal.get(hash_)
+        require(record["chain_id"]==self.chain["chain_id"] and record["sender"]==wallet["address"],"Record does not match chain and wallet")
+        context.update(hash=hash_,nonce=record["tx"]["nonce"],status="signed_not_broadcast")
+        if not params.get("execute"):return {"status":"preview","hash":hash_,"transaction":record["tx"]}
+        require(wallet["account"],"Watch-only wallet cannot sign","WALLET_ERROR")
+        with journal.lock(self.chain["chain_id"],wallet["address"]):
+            context["phase"]="signing"
+            signed=wallet["account"].sign_transaction(record["tx"])
+            require(Web3.to_hex(signed.hash)==hash_,"Reconstructed transaction hash differs")
+            context["phase"]="lookup_original"
             try:
-                self.rpc.read(lambda w: w.eth.get_transaction(hash_))
-                journal.status(hash_, "broadcast")
-                known = True
+                self.rpc.read(lambda w:w.eth.get_transaction(hash_));known=True
             except ToolError as exc:
-                if exc.code != "NOT_FOUND": raise
-                known = False
-            if not known:
-                try:
-                    returned = self.rpc.send(signed.raw_transaction)
-                    require(Web3.to_hex(returned) == hash_, "RPC hash mismatch", "BROADCAST_UNKNOWN")
-                except ToolError:
-                    journal.status(hash_, "unknown")
-                    raise ToolError("BROADCAST_UNKNOWN", "Replay outcome unknown", data={"hash": hash_}) from None
-                journal.status(hash_, "broadcast")
-            out = {"hash": hash_, "status": "already_known" if known else "broadcast"}
-            if params.get("wait"):
-                receipt = wait_receipt(self.rpc, hash_, params.get("confirmations", self.chain["confirmations"]), params.get("timeout", 120))
-                journal.status(hash_, "confirmed" if receipt["status"] == 1 else "failed")
-                out.update(receipt=receipt, status="confirmed" if receipt["status"] == 1 else "failed")
-                if receipt["status"] != 1:
-                    raise ToolError("TRANSACTION_FAILED", "Transaction reverted on chain", data=out)
+                if exc.code!="NOT_FOUND":raise
+                known=False
+            out={"hash":hash_}
+            if known:
+                context.update(already_known=True,status="broadcast_unconfirmed")
+                out.update(context);self._journal_status(journal,context,"broadcast",out)
+            else:self._broadcast(signed,context,journal,out)
+            if params.get("wait"):return self._wait(context,journal,out,params)
             return out

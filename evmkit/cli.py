@@ -9,9 +9,9 @@ from .common import ToolError, jsonable, result, require, wallet_selectors
 from .config import Config
 from .operations import OPS, Toolkit
 
-JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types", "override", "field_map"}
-BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache", "include_inputs", "verify"}
-NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses", "limit", "word"}
+JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types", "override", "field_map","functions"}
+BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache", "include_inputs", "verify","auto","include_source"}
+NUM_FIELDS = {"decimals", "confirmations", "timeout", "chunk_size", "time_budget_seconds", "max_requests", "max_frames", "max_depth", "max_pages", "max_tokens", "max_addresses", "limit", "word", "take_candidate","max_probes","max_nodes","max_proxy_depth","max_source_files"}
 
 
 class ParseError(Exception): pass
@@ -52,6 +52,7 @@ def main(module, argv=None):
                 continue
             if field=="verify":
                 kwargs["action"]="store_true";kwargs["help"]="Required: eth_call the patched payload from the selected sender; never broadcasts"
+            elif field == "no_semantics":kwargs["action"]="store_true"
             elif field == "no_cache":
                 kwargs["action"]="store_true"
                 kwargs["help"]="Refresh persistent caches; within-request deduplication remains enabled"
@@ -100,7 +101,13 @@ def main(module, argv=None):
             require(operation is None or operation == request["operation"], "Operation differs from JSON input")
             operation, opts = request["operation"], request["params"]
         require(operation is not None, "Provide a subcommand or --input-json")
+        if module=="contract" and operation=="selector":
+            require(isinstance(opts,dict) and set(opts)=={"signature"},"selector requires only signature")
+            from .abi import selector
+            print(json.dumps(result('contract.selector',{'signature':opts['signature'],'selector':selector(opts['signature'])}),separators=(',',':')))
+            return 0
         analysis_only = module in ("events","address") or module == "raw" and operation=="patch" and not opts.get("wallet") or module == "chain" and operation == "probe" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
+        analysis_only = analysis_only or module=="contract" and operation in ("functions","encode","introspect","diagnose")
         config = Config(path=config_options.get("config"), env_file=config_options.get("env_file"), state_dir=config_options.get("state_dir"), load_wallets=not analysis_only)
         response = Toolkit(config).run(module, operation, opts)
     except (ParseError, ToolError) as exc:

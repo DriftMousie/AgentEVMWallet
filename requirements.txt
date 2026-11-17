@@ -7,3 +7,4 @@ requests==2.32.5
 # Public signature recovery/encoding for EIP-7702 authorization evidence.
 eth-keys==0.7.0
 rlp==4.1.0
+PyYAML==6.0.3

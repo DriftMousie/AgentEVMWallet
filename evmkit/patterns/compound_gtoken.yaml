@@ -1,0 +1,37 @@
+id: compound_gtoken
+label: Gravity GToken interface variant; not a universal Compound adapter
+match:
+  functions_all: ["redeemToken(address,uint256)", "redeemUnderlying(address,uint256)", "supply(address,uint256)", "borrow(address,uint256)", "totalBorrow()", "exchangeRate()", "getCash()"]
+  relations_all: [core]
+entries:
+  shares: {target: core, function: "redeemToken(address,uint256)", args: [{ref: root}, {ref: amount_raw}]}
+  assets: {target: core, function: "redeemUnderlying(address,uint256)", args: [{ref: root}, {ref: amount_raw}]}
+checks:
+  - {id: paused, target: core, function: "paused()", args: [], expect: false, severity: blocker}
+  - {id: listed, target: core, function: "marketInfos(address)", args: [{ref: root}], field: isListed, expect: true, severity: blocker}
+  - {id: balance, target: root, function: "balanceOf(address)", args: [{ref: account}], gte: {ref: shares_required}, severity: blocker, needs: [account, amount_raw]}
+  - {id: cash, target: root, function: "getCash()", args: [], gte: {ref: gross_assets}, severity: blocker, needs: [amount_raw]}
+  - {id: validator_allowed, target: validator, function: "redeemAllowed(address,address,uint256)", args: [{ref: root}, {ref: account}, {ref: shares_required}], expect: true, severity: blocker, needs: [account, amount_raw]}
+  - {id: fee_rate, target: validator, function: "getAccountRedeemFeeRate(address)", args: [{ref: account}], output_type: uint, severity: info, needs: [account]}
+asset_binding: underlying
+reads:
+  - {bind: validator, target: core, relation: validator}
+  - {bind: grvDistributor, target: core, relation: grvDistributor}
+  - {bind: exchange_rate, target: root, function: "exchangeRate()", args: []}
+source_guards:
+  - {id: conversion_scale, function: _redeem, condition_contains: "gAmountIn.mul(exchangeRate()).div(1e18)", gates: [shares_required, gross_assets]}
+route_guard:
+  modifier: onlyCore
+  predicate: "msg.sender==address(core)"
+  functions: {shares: "redeemToken(address,uint256)", assets: "redeemUnderlying(address,uint256)"}
+equations:
+  shares:
+    shares_required: {ref: amount_raw}
+    gross_assets: {op: div_floor, args: [{op: mul, args: [{ref: amount_raw}, {ref: exchange_rate}]}, "1000000000000000000"]}
+  assets:
+    shares_required: {op: div_floor, args: [{op: mul, args: [{ref: amount_raw}, "1000000000000000000"]}, {ref: exchange_rate}]}
+    gross_assets: {ref: amount_raw}
+unknowns:
+  - {id: core_external_effects, reason: non_view_notification_path_not_verified, target: grvDistributor, severity: blocker}
+estimate: {binding: gross_assets, scope: gross_before_unknown_fee, net_known: false}
+entry_source_required: false

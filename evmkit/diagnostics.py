@@ -7,6 +7,7 @@ REASONS = {
     "SOURCE_UNAVAILABLE": "unavailable", "ANALYSIS_LIMIT": "budget_exhausted",
 }
 CAPABILITIES = {"CALL_TRACE": "internal_calls", "INTERNAL_CALLS": "internal_calls",
+                "SOURCE_TEXT":"source","SOURCE_MAIN_FILE":"source","SOURCE_TEXT_UNAVAILABLE":"source","SOURCE_MAIN_FILE_UNKNOWN":"source",
                 "INTERNALS": "internal_calls", "STATE_DIFF": "native_state_diff",
                 "METADATA": "identity", "COUNTERPART": "identity", "SENDER": "identity",
                 "COUNTERPART_CODE": "identity", "COUNTERPART_PROXY": "identity", "ACTIVITY": "activity",

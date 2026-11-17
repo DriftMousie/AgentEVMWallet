@@ -241,3 +241,27 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 - timing 识别明确时间字段，分析按本机 UTC、缓存命中重算；plan 相对时间使用最新区块。特殊值/未知单位不猜，过期标风险，不直接丢掉原始数据。
 - raw.patch 只替换 selector 后零基 word，显式 address/uint256/bytes32，必须 verify 和完整上下文；无 execute，不广播，失败保留 diff/data/revert details。
 - fund_flows.refunds 单列 confirmed/refund_candidate，附交易内位置与区块日志索引，不凭微小数量判断，不重复扣 net。全部 Markdown、help/describe 同步；真实样本和测试只留临时目录，不发布用户交易/钱包材料。
+
+
+## 14. 广播结果保全与候选复现修复
+
+- 签名 hash/阶段/广播尝试/回执通过操作级执行上下文保全；普通发送、替换、replay、多步骤授权与 batch 错误仍保留交易身份。发送前日志保存必须成功，发送后日志更新错误不推翻已确认成功。
+- 状态分开 not_broadcast、signed_not_broadcast、broadcast_unknown、broadcast_unconfirmed、confirmed、reverted；复合失败保留 transactions。模拟错误迁移为 SIMULATION_REVERTED，已确认失败为 EXECUTION_REVERTED，确认查询错误为 CONFIRMATION_UNAVAILABLE；不自动重发。
+- 参数完整时 execute 无 hash 的失败尽力做 nonce 自检，缺基准保持 unknown；增长不等于本次广播。transaction.wait 带 hash/status/receipt，旧回执其他顶层字段暂时兼容，原数字状态改读 receipt.status。
+- plan 对 delegation 先提示业务候选；唯一且来源完整时自动生成内层预览并模拟，多候选 template=null。新增 take-candidate 零基索引，与 take-call 互斥；include-inputs 同时控制 candidates/source_call 原始数据，失败也保留。
+- 显式 NFT tokenId 只改可靠 ABI 唯一字段；auto 仅支持已确认/用户显式断言的合约分配 ID 创建接口，不猜计数器，不照搬原 mint ID。锁仓时间与交易 deadline 分开，实际 ID 从成功回执读取。
+- 本地扩充 Solidity/ERC-6093 错误、Expired 名称模式，保留原始 bytes/候选/命名参数/解释及来源；只有精确失败交易 trace 可补链上原因，不用最新模拟冒充历史结果。
+- 更新全部 5 份 Markdown、help/describe；用合成故障测试确认超时/重组/日志故障/广播未知/批量停止和候选原始数据保留；公开样本仅做只读验收，测试与真实材料不进仓库。
+
+
+## 15. 合约结构分析与退出诊断
+
+- 保持 13 个顶层入口，在 contract 增加 introspect/diagnose/selector；两个新分析命令默认 2KB 摘要，静态 describe 扩展为七项。旧 functions/call/encode 可按 chain/contract 自动取有效 ABI，显式 ABI 优先，write 不扩大自动执行。
+- 标准代理槽/beacon、EIP-1822、精确 EIP-1167 与 7702 标记最多跟随四跳；代码/存储/调用上下文分开，代理管理 ABI 不混业务。getter/浏览器只是候选，嵌套上下文未明即 partial，不读实现自身存储冒充用户状态。
+- 指针每轮读取，静态 ABI/源码按链、地址、代码哈希缓存一小时；词法结果再绑定源哈希/路径/版本。状态与 verdict 不持久缓存，升级即使代理 code_hash 未变也不得复用旧结构。
+- 同一区块批量 view/pure 读取，20 个一批，默认 50 项；按 ABI 递归解码和失败隔离。批量拒绝有限逐项降级，参数不足不猜。图上限 10 地址，普通关系一跳，诊断只跟模式所需两跳依赖。
+- 三源读取已验证源码文本，默认一个实现主文件、可调整数量；不下载任意 import/URI。词法提取 modifier/require/成员调用，附限定定义、文件行号与片段，注释字符串不当指令，不编译、反编译或合并继承证明。
+- YAML 模式声明接口、关系、只读检查、有限整数表达式和源码守卫；拒绝代码标签、重复键、别名和过深结构。首批为 Gravity GToken 变体与 ERC-4626，不按合约名/标签认协议。GToken 显式 preset 不遮蔽原自动已验证 ABI 解码。
+- amount 默认 shares，人类/原始单位互斥；assets 显式选择，缺精度不猜。退出结论 likely_yes/unknown/likely_no 与结构完整度分开，缺账户/金额不产完整 calldata，非 view 闸门和未覆盖外部通知保留 blocker 级未知；毛额不是净到账。
+- 默认 60 秒/150 HTTP/50 探测/10 节点/4 跳/1 源文件；固定区块末检查规范性，预算不足保留结构和未知项。所有新诊断不加载钱包私钥、模拟非 view 退出、签名或广播。
+- 新增合约分析参考，更新 README/Skill/现有参考与设计稿；测试及真实样本明细留临时目录。gDAI 只读检验使用当轮区块，不固定历史现金和费率，也不声称完成资金退出。

@@ -6,8 +6,19 @@ from web3 import Web3
 def suggested_next(params, data=None, code=None):
     params=params if isinstance(params,dict) else {}
     data=data if isinstance(data,dict) else {}
-    chain,hash_=params.get("chain"),params.get("hash")
+    chain,hash_=params.get("chain"),data.get("hash") or params.get("hash")
     steps=[]
+    if code in ("RPC_UNAVAILABLE","CANONICALITY_UNAVAILABLE") and chain and params.get("address") and not hash_:
+        steps.append({"module":"contract","operation":"introspect","params":{"chain":chain,"address":params['address'],"view":"summary","no_cache":True},"reason":"Restore a working RPC, then retry this read-only pinned-block analysis"})
+    if code in ("ABI_REQUIRED","ABI_UNAVAILABLE") and chain and (params.get("contract") or params.get("address")):
+        steps.append({"action":"check_verified_sources","files":["config/explorers.toml","config/explorers.local.toml"],"reason":"Enable an available verification provider or supply a reliable explicit ABI; a preset is not verification"})
+    if code in ("CONFIRMATION_TIMEOUT","CONFIRMATION_UNAVAILABLE","BROADCAST_UNKNOWN") and chain and hash_:
+        steps.append({"action":"transaction.wait","module":"transaction","operation":"wait","params":{"chain":chain,"hash":hash_},
+                      "reason":"Query the known original hash; a confirmation error does not authorize another send"})
+    if code=="BROADCAST_UNKNOWN" and chain and data.get("previous_hash"):
+        steps.append({"module":"transaction","operation":"inspect","params":{"chain":chain,"hash":data["previous_hash"]},"reason":"Resolve the earlier recorded transaction before preparing a new one"})
+    if code in ("TOKEN_ID_AUTO_UNSUPPORTED","UNSUPPORTED_OVERRIDE"):
+        steps.append({"action":"check_nft_creation_interface","reason":"Use a confirmed creation ABI; contract-assigned IDs are read from the successful receipt. Existing NFT IDs and lock units must be supplied explicitly"})
     if code in ("CONTEXT_DEPENDENT_CALL","CALL_SELECTION_AMBIGUOUS","CALL_NOT_FOUND","CALL_INPUT_UNAVAILABLE","CALL_CONTEXT_UNSUPPORTED"):
         steps.append({"action":"inspect_call_candidates","path":"data.candidates" if data.get("candidates") else "data.source_call",
                       "reason":"Choose an ordinary business CALL using its exact trace path or declared execution index; never automatically choose the first match or copy authorization context"})
@@ -33,7 +44,7 @@ def suggested_next(params, data=None, code=None):
     if code in ("SOURCE_UNCONFIGURED","CONFIG_ERROR","SOURCE_UNAUTHORIZED"):
         steps.append({"action":"check_configuration","files":["config/settings.toml","config/explorers.toml","config/explorers.local.toml"],
                       "reason":"Check enabled provider, required local key and account permissions; never print credential values"})
-    if code in ("CALL_REVERTED","TOKEN_OPERATION_FAILED") and data.get("template"):
+    if code in ("CALL_REVERTED","SIMULATION_REVERTED","TOKEN_OPERATION_FAILED") and data.get("template"):
         steps.append({"action":"inspect_plan_diff","reason":"Check recipient, owner, deadline, wallet-bound proof/signature and current balances; do not bypass the failed simulation"})
     if code in ("RPC_UNAVAILABLE","SOURCE_TIMEOUT","SOURCE_RATE_LIMITED") and chain and hash_:
         steps.append({"module":"transaction","operation":"analyze","params":{"chain":chain,"hash":hash_,"no_cache":True,"view":"summary"},

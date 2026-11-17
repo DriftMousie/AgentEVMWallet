@@ -102,7 +102,8 @@ def jsonable(value: Any):
         structural = {"schema_version", "chain_id", "decimals", "confirmations", "data_bytes", "completed_through", "latency_ms", "failed_step",
                       "returned","limit","pages","count","success","failed","unknown","non_call_transactions","token_count","nft_count","risk_count","unknowns_count",
                       "requests_used","current_requests_used","rpc_calls","ttl_seconds","planned_pairs","attempted_pairs","completed_pairs","summary_max_utf8_bytes",
-                      "input_bytes","word_index","byte_offset","execution_index","reference_timestamp","refund_count","receipt_position","log_index"}
+                      "input_bytes","word_index","byte_offset","execution_index","reference_timestamp","refund_count","receipt_position","log_index","candidate_index","auto_selected_candidate","required_confirmations",
+                      "code_bytes","functions_count","events_count","errors_count","depth","omitted_probes","line","end_line","blocker_count","unknown_count"}
         out={}
         for k,v in value.items():
             if k in ("path","call_path","field_path") and isinstance(v,list) and all(isinstance(i,int) and not isinstance(i,bool) or isinstance(i,str) and i.isdigit() for i in v):

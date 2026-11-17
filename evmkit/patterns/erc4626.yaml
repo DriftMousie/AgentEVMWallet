@@ -1,0 +1,30 @@
+id: erc4626
+label: ERC-4626 read-only withdrawal preconditions
+match:
+  functions_all: ["asset()", "totalAssets()", "convertToAssets(uint256)", "redeem(uint256,address,address)", "withdraw(uint256,address,address)", "deposit(uint256,address)", "maxRedeem(address)", "maxWithdraw(address)", "previewRedeem(uint256)", "previewWithdraw(uint256)"]
+  relations_all: [asset]
+entries:
+  shares: {target: root, function: "redeem(uint256,address,address)", args: [{ref: amount_raw}, {ref: account}, {ref: account}]}
+  assets: {target: root, function: "withdraw(uint256,address,address)", args: [{ref: amount_raw}, {ref: account}, {ref: account}]}
+checks:
+  - {id: max_redeem, target: root, function: "maxRedeem(address)", args: [{ref: account}], gte: {ref: amount_raw}, unit: shares, severity: blocker, needs: [account, amount_raw]}
+  - {id: max_withdraw, target: root, function: "maxWithdraw(address)", args: [{ref: account}], gte: {ref: amount_raw}, unit: assets, severity: blocker, needs: [account, amount_raw]}
+  - {id: share_balance, target: root, function: "balanceOf(address)", args: [{ref: account}], gte: {ref: shares_required}, severity: blocker, needs: [account, amount_raw]}
+asset_binding: asset
+reads: []
+reads_by_unit:
+  shares:
+    - {bind: gross_assets, target: root, function: "convertToAssets(uint256)", args: [{ref: amount_raw}]}
+    - {bind: preview_assets, target: root, function: "previewRedeem(uint256)", args: [{ref: amount_raw}]}
+  assets:
+    - {bind: shares_required, target: root, function: "previewWithdraw(uint256)", args: [{ref: amount_raw}]}
+source_guards: []
+equations:
+  shares:
+    shares_required: {ref: amount_raw}
+  assets:
+    gross_assets: {ref: amount_raw}
+    preview_assets: {ref: amount_raw}
+unknowns: []
+estimate: {binding: preview_assets, scope: ERC4626_preview_not_guaranteed, net_known: true}
+entry_source_required: true

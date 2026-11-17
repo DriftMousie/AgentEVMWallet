@@ -136,6 +136,11 @@ def encode_call(signature, args):
         raise ToolError("INVALID_INPUT", "Arguments cannot be ABI encoded") from None
 
 
+def selector(signature):
+    signature_parts(signature)
+    return Web3.to_hex(Web3.keccak(text=signature)[:4])
+
+
 def decode_call(data, signature=None, abi=None):
     data = hexdata(data)
     if abi is not None:
@@ -156,18 +161,58 @@ def decode_call(data, signature=None, abi=None):
         raise ToolError("DECODE_ERROR", "Calldata does not match supplied types") from None
 
 
+# Standard names/arguments: https://eips.ethereum.org/EIPS/eip-6093
+STANDARD_ERRORS = [
+    ("ERC20InsufficientBalance",[("sender","address"),("balance","uint256"),("needed","uint256")]),
+    ("ERC20InsufficientAllowance",[("spender","address"),("allowance","uint256"),("needed","uint256")]),
+    ("ERC20InvalidSender",[("sender","address")]),("ERC20InvalidReceiver",[("receiver","address")]),
+    ("ERC20InvalidApprover",[("approver","address")]),("ERC20InvalidSpender",[("spender","address")]),
+    ("ERC721InvalidOwner",[("owner","address")]),("ERC721NonexistentToken",[("tokenId","uint256")]),
+    ("ERC721IncorrectOwner",[("sender","address"),("tokenId","uint256"),("owner","address")]),
+    ("ERC721InvalidSender",[("sender","address")]),("ERC721InvalidReceiver",[("receiver","address")]),
+    ("ERC721InsufficientApproval",[("operator","address"),("tokenId","uint256")]),
+    ("ERC721InvalidApprover",[("approver","address")]),("ERC721InvalidOperator",[("operator","address")]),
+    ("ERC1155InsufficientBalance",[("sender","address"),("balance","uint256"),("needed","uint256"),("tokenId","uint256")]),
+    ("ERC1155InvalidSender",[("sender","address")]),("ERC1155InvalidReceiver",[("receiver","address")]),
+    ("ERC1155MissingApprovalForAll",[("operator","address"),("owner","address")]),
+    ("ERC1155InvalidApprover",[("approver","address")]),("ERC1155InvalidOperator",[("operator","address")]),
+    ("ERC1155InvalidArrayLength",[("idsLength","uint256"),("valuesLength","uint256")]),
+]
+PANICS={0x00:"Compiler-inserted panic",0x01:"Assertion failed",0x11:"Arithmetic overflow or underflow",
+        0x12:"Division or modulo by zero",0x21:"Invalid enum conversion",0x22:"Invalid storage byte array encoding",
+        0x31:"Pop on empty array",0x32:"Array index out of bounds",0x41:"Memory allocation overflow",0x51:"Uninitialized function pointer"}
+
+
 def decode_revert(data, abi=None):
-    data = hexdata(data)
-    candidates = [("Error(string)", ["string"]), ("Panic(uint256)", ["uint256"])]
-    for item in abi or []:
-        if item.get("type") == "error":
-            sig = canonical(item)
-            candidates.append((sig, signature_parts(sig)[1]))
-    for signature, types in candidates:
-        if data[:10] == "0x" + Web3.keccak(text=signature)[:4].hex():
-            try:
-                values = decode(types, bytes.fromhex(data[10:]))
-                return {"error_signature": signature, "error_args": jsonable(values)}
-            except Exception:
-                break
-    return {"error_signature": None}
+    data=hexdata(data)
+    base={"revert_data":data,"error_selector":data[:10] if len(data)>=10 else None,"error_signature":None,"error_candidates":[]}
+    if len(data)<10 or len(data)>131074:return base
+    candidates=[(item,"explicit_abi") for item in abi or [] if item.get("type")=="error"]
+    for name,fields in [("Error",[("reason","string")]),("Panic",[("code","uint256")])]+STANDARD_ERRORS:
+        candidates.append(({"type":"error","name":name,"inputs":[{"name":n,"type":t} for n,t in fields]},"solidity_builtin" if name in ("Error","Panic") else "erc6093"))
+    candidates.append(({"type":"error","name":"Expired","inputs":[]},"name_pattern"))
+    seen=set()
+    for item,source in candidates:
+        try:
+            signature=canonical(item);types=signature_parts(signature)[1]
+            if signature in seen or data[:10]!=Web3.to_hex(Web3.keccak(text=signature)[:4]):continue
+            values=decode(types,bytes.fromhex(data[10:]))
+            if encode(types,values).hex()!=data[10:]:continue
+            seen.add(signature)
+            names=[i.get("name") or f"arg{j}" for j,i in enumerate(item["inputs"])]
+            if len(set(names))!=len(names):names=[f"arg{j}" for j in range(len(values))]
+            row={"error_signature":signature,"error_args":jsonable(values),"error_named_args":dict(zip(names,jsonable(values))),"source":source,
+                 "confidence":"name_pattern" if source=="name_pattern" else "decoded_layout"}
+            if item["name"]=="Error":explanation=str(values[0])
+            elif item["name"]=="Panic":explanation=PANICS.get(int(values[0]),"Unknown Solidity panic code")
+            elif signature=="ERC20InsufficientAllowance(address,uint256,uint256)":explanation=f"ERC-20 allowance is insufficient: spender {values[0]}, allowance {values[1]}, needed {values[2]} (raw token units)"
+            elif "InsufficientBalance" in item["name"]:explanation="Token balance is insufficient; compare balance and needed in raw token units"
+            elif signature=="Expired()":explanation="An expiry check failed; the selector alone does not identify which deadline or condition expired"
+            elif "Approval" in item["name"]:explanation="NFT approval is missing or the operator is not authorized"
+            elif item["name"]=="ERC721IncorrectOwner":explanation="The supplied NFT sender does not own this tokenId"
+            else:explanation=item["name"]+": inspect the decoded named arguments"
+            row["error_explanation"]=explanation;base["error_candidates"].append(row)
+        except Exception:continue
+    if len(base["error_candidates"])==1:base.update(base["error_candidates"][0])
+    elif base["error_candidates"]:base["error_explanation"]="Multiple error layouts match; preserve all candidates rather than choosing one"
+    return base
