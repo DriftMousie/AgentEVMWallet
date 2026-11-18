@@ -321,7 +321,7 @@ class Inspector:
         return {'structure':s,'abi':{'source':mat.get('provider'),'address':effective,'verified':mat.get('verified'),'items':abi,
                     'functions_count':sum(i.get('type')=='function' for i in abi or []),'events_count':sum(i.get('type')=='event' for i in abi or []),'errors_count':sum(i.get('type')=='error' for i in abi or [])} if abi is not None else None,
                 'probes':all_probes,'relations':{'nodes':list(self.nodes.values()),'edges':self.edges,'scope':'one_hop_plus_pattern_dependencies','truncated':any(i['capability']=='relations' and i['reason']=='truncated' for i in self.issues)},
-                'semantics':semantics,'patterns':[],'issues':self.issues,'enhancements_missing':self.sources.enhancements_missing,
+                'semantics':semantics,'patterns':[],'patterns_status':'unavailable','issues':self.issues,'enhancements_missing':self.sources.enhancements_missing,
                 'analysis_status':'complete' if s['resolution_status']=='complete' and abi is not None and self.canonicality=='verified' else 'partial',
                 'components':{'structure':s['resolution_status'],'abi':'available' if abi is not None else 'unavailable','probes':'partial' if self.omitted_probes or any(r['status'] not in ('success','skipped_requires_arguments') for r in all_probes) else 'complete','semantics':semantics.get('status') if semantics else 'unavailable'},
                 'block':{'number':str(hexnum(self.block)),'hash':self.block_hash,'canonicality':self.canonicality},'checked_at':self.checked_at,
@@ -341,25 +341,33 @@ def inspect_contract(config,chain,rpc,params,diagnose=False):
         raise ToolError('NOT_A_CONTRACT','Address has no deployed contract code at the pinned block',data={'structure':{'address':target,'kind':'precompile' if int(target,16)<=0x11 else 'empty_code','code_bytes':0},'block':{'number':str(hexnum(inspector.block)),'hash':inspector.block_hash}})
     if node is None or node['is_contract'] is None:raise ToolError('RPC_UNAVAILABLE','Cannot establish root contract code',retryable=True,data={'structure':{'address':target,'kind':'unknown'},'verdict':{'answer':'unknown'} if diagnose else None})
     inspector.structure(target);skipped=[];sem=None;diagnostic=None
+    patterns = []
+    patterns_status = 'unavailable'
     try:
         if diagnose:
-            for name in ('core','asset','underlying'):inspector.relation(target,name)
             sem=inspector.semantics(target)
             from .diagnose import diagnose_contract
             diagnostic=diagnose_contract(inspector,target,sem)
+        else:
+            from .patternmatch import inspect_patterns
+            found, patterns_status, _ = inspect_patterns(inspector, target)
+            patterns = [{key:value for key,value in hit.items() if key != 'definition'} for hit in found]
         skipped=inspector.batch_probes(target)
         for name in RELATIONS:
             if len(inspector.nodes)>=inspector.limits['max_nodes']:inspector.issue('relations','truncated',target);break
             inspector.relation(target,name)
         if not diagnose:sem=inspector.semantics(target)
     except ToolError as exc:
-        if exc.code in ('INVALID_INPUT','READ_ONLY_REQUIRED'):raise
+        if exc.code in ('INVALID_INPUT','READ_ONLY_REQUIRED','DEPENDENCY_MISSING','PATTERN_INVALID'):raise
         inspector.issue('orchestration',exc.code,target)
     inspector.canonical_check();out=inspector.report(target,skipped,sem)
+    out.update(patterns=patterns, patterns_status=patterns_status)
     if diagnose:
         out.update(diagnostic or {'patterns':[],'verdict':{'question':'can_redeem','answer':'unknown','confidence':'low','entry':None,'checks':[],'blockers':[],'unknowns':[{'id':'incomplete','severity':'blocker','reason':'diagnostic_incomplete'}]}})
         if inspector.canonicality!='verified':
             out['verdict'].update(answer='unknown',confidence='low');out['verdict']['unknowns'].append({'id':'canonicality','severity':'blocker','reason':inspector.canonicality})
+    if inspector.canonicality != 'verified' and out['patterns_status'] == 'complete':
+        out['patterns_status'] = 'partial'
     return out
 
 
@@ -375,6 +383,7 @@ def summary_envelope(response):
     full=response.get('data') or {};s=full.get('structure') or {};v=full.get('verdict')
     body={'view':'summary','analysis_status':full.get('analysis_status'),'structure':{k:s.get(k) for k in ('address','kind','is_proxy','proxy_type','effective_address','resolution_status')},
           'block':full.get('block'),'checked_at':full.get('checked_at'),'patterns':[p.get('id') for p in full.get('patterns',[])],
+          'patterns_status':full.get('patterns_status','unavailable'),
           'probes_count':len(full.get('probes',[])),'issues_count':len(full.get('issues',[])),'enhancements_missing_count':len(full.get('enhancements_missing',[])),
           'probes':[{k:r.get(k) for k in ('function','status','values')} for r in full.get('probes',[])],
           'issues':full.get('issues',[]),'trimmed':{'probes':0,'issues':0,'verdict_checks':0,'blockers':0,'unknowns':0,'verdict_fields':0},'truncated':False}

@@ -13,6 +13,7 @@ from .abi import ERC20, NFT, canonical, coerce, decode_call, decode_revert, enco
 from .common import ToolError, address, formatted, hexdata, jsonable, read_json, require, result, txhash, uint, units, wallet_selectors
 from .engine import Engine, Journal, fees, fee_summary, wait_receipt
 from .rpc import RPC
+from .error_details import check_dependencies, diagnostic_error
 
 WRITE = {"execute", "gas", "gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "skip_simulation", "reason", "wait", "timeout", "confirmations"}
 BASE = {"chain", "wallet"}
@@ -31,7 +32,7 @@ OPS = {
                     "wait": {"chain", "hash", "confirmations", "timeout"},
                     "decode": {"chain", "hash", "abi", "signature"} | ANALYSIS,
                     "analyze": {"chain", "hash", "abi", "signature", "tokens", "addresses", "require_trace", "focus_address", "view", "include_inputs"} | ANALYSIS,
-                    "plan": {"chain","hash","wallet","abi","signature","override","field_map","take_call","take_candidate","include_inputs","gas","gas_price_wei","max_fee_per_gas_wei","max_priority_fee_per_gas_wei"} | ANALYSIS,
+                    "plan": {"chain","hash","wallet","address","abi","signature","override","field_map","take_call","take_candidate","include_inputs","gas","gas_price_wei","max_fee_per_gas_wei","max_priority_fee_per_gas_wei"} | ANALYSIS,
                     "export-template": {"chain", "hash", "abi", "signature", "output"} | ANALYSIS,
                     "accelerate": BASE | WRITE | {"hash"}, "cancel": BASE | WRITE | {"hash"},
                     "replay": BASE | {"hash", "execute", "wait", "confirmations", "timeout"}},
@@ -136,13 +137,18 @@ class Toolkit:
             response["data"]=jsonable(payload)
         from .agent_output import suggested_next,summary_envelope
         if module=="transaction" and operation=="analyze" and response.get("ok"):
-            from .calldata import refresh_timing,input_fields
-            refresh_timing(response["data"])
-            include=params.get("include_inputs",False)
-            for group in (response["data"].get("internal_calls",{}),response["data"].get("declared_calls",{})):
+            from .calldata import refresh_timing, input_fields, expanded_input
+            analysis = response["data"]
+            refresh_timing(analysis)
+            transaction = analysis["inspection"]["transaction"]
+            include = params.get("include_inputs", False)
+            now = int(time.time())
+            if include:
+                analysis.update(expanded_input({"input":transaction["data"], "decoded":analysis["input_decode"]}, transaction, now))
+            for group in (analysis.get("internal_calls",{}),analysis.get("declared_calls",{})):
                 for row in group.get("calls",[]):
                     row.update(input_fields(row))
-                    if include: row["input_raw"]=row.get("input")
+                    if include: row.update(expanded_input(row, transaction, now))
                     else: row.pop("input",None);row.pop("input_raw",None)
         if response.get("error"):
             response["error"]["suggested_next"]=suggested_next(params,response.get("data"),response["error"]["code"])
@@ -161,10 +167,14 @@ class Toolkit:
             require(module in OPS and operation in OPS[module], "Unknown operation")
             require(isinstance(params, dict), "params must be an object")
             require(not (set(params) - OPS[module][operation]), "Unknown operation parameters")
+            check_dependencies(module, operation)
             for key in ("execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache", "include_inputs", "verify","auto","no_semantics","include_source"):
                 if key in params: require(isinstance(params[key], bool), f"{key} must be boolean")
             if params.get("chain"):
                 chain_id = self.config.chain(params["chain"])["chain_id"]
+            if module == "transaction" and operation == "plan":
+                require(not (params.get("wallet") is not None and params.get("address") is not None),
+                        "Use wallet or address, not both")
             if params.get("wallet"):
                 wallet = self.config.public_wallet(self.config.wallet(params["wallet"]))
             method = getattr(self, module + "_" + operation.replace("-", "_"))
@@ -173,10 +183,16 @@ class Toolkit:
         except ToolError as exc:
             return result(name, exc.data, chain_id=chain_id, wallet=wallet, warnings=self.config.warnings + self.warnings,
                           error={"code": exc.code, "message": exc.message, "retryable": exc.retryable})
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return result(name, error={"code": "INVALID_INPUT", "message": "Missing or invalid operation parameters", "retryable": False})
-        except Exception:
-            return result(name, error={"code": "INTERNAL_ERROR", "message": "Operation failed; no sensitive exception details are emitted", "retryable": False})
+        except Exception as exc:
+            # Existing operations may index required, user-supplied parameters.
+            missing_param = (isinstance(exc, KeyError) and len(exc.args) == 1
+                             and isinstance(exc.args[0], str)
+                             and exc.args[0] in OPS.get(module, {}).get(operation, ())
+                             and isinstance(params, dict) and exc.args[0] not in params)
+            error = diagnostic_error(exc, invalid_input=missing_param)
+            return result(name, error.data, chain_id=chain_id, wallet=wallet,
+                          warnings=self.config.warnings + self.warnings,
+                          error={"code":error.code, "message":error.message, "retryable":error.retryable})
 
     def chain_list(self, p):
         return [{"alias": k, **v} for k, v in self.config.chains.items()]
@@ -336,8 +352,14 @@ class Toolkit:
         cache=SnapshotCache(self.config);key=analysis_key(self.config,p)
         hit=cache.get(key) if not p.get("no_cache") else None
         if hit:
+            from .agent_output import transaction_conclusion
+            from .calldata import call_depth
             hit["cached"]=True
             hit["cache"]["current_requests_used"]=0
+            hit.update(transaction_conclusion(hit))
+            for group in (hit.get("internal_calls", {}), hit.get("declared_calls", {})):
+                for row in group.get("calls", []):
+                    row["depth"] = call_depth(row)
             self.warnings.extend(hit.get("warnings",[]))
             return hit
         inspected = self.transaction_inspect(p)

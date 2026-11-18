@@ -58,9 +58,9 @@ fund_flows 默认聚焦原 from，可用 --focus-address 指定对象。tokens �
 
 未知函数时可使用 classification.inferred_intent，但必须保留 confidence/evidence；它不证明购买业务或滑点保护。issues/data.suggested_next 和真正失败时的 error.suggested_next 提供结构化后续动作，只使用已有候选，不编造函数签名，不因下一步建议而自动广播。
 
-`transaction.py plan --chain ... --hash ... --wallet ...` 仅预览，不能传 execute 或跳过模拟。已确认标准受益人改为选定钱包，diff 必须展示；owner、签名/证明保持原值，deadline 仅在用户显式覆盖时修改。override.args 是完整数组或唯一参数名对象，override.value_wei 单独指定；amount 简写只适用于唯一主要输入的标准接口，单位为最小单位整数。未确认 calldata 默认原样模拟；显式 typed field_map 允许按整 word 修改，必须标 payload_unverified 并模拟，不能猜偏移。模拟失败仍应读取模板、diff 和错误。
+`transaction.py plan` 只需 chain 和 hash 即可生成模板。指定钱包或公开地址可模拟、估费，并按已确认 ABI 调整受益人。两者都省略时保留原收件人，返回 `template_only` 与 `SIMULATION_SKIPPED_NO_SENDER`。`recipient:self` 需要发送者。未知参数的显式 typed field_map 仍标 `payload_unverified`。展开 `--include-inputs` 可查看疑似字段，仅将其用于人工定位。查看返回的模板、差异和模拟状态后再决定是否执行。
 
-分析快照可零网络命中；cached/analyzed_at/cache 标明原分析时间，不能冒充实时重验。需要刷新时用 --no-cache；plan 的 Nonce、模拟、余额、费用始终实时读取。地址历史的 limit/cursor/complete 说明窗口与分页，actions 只汇总近期直接调用候选，不声称覆盖全部历史或内部调用。
+分析快照可零网络命中；cached/analyzed_at/cache 标明原分析时间，不能冒充实时重验。需要刷新时用 --no-cache；plan 指定发送者时实时读取 Nonce、模拟、余额和费用。地址历史优先读 resolved_function，遇到 approve 歧义时核对代币接口。limit/cursor/complete 说明窗口与分页，actions 只汇总近期直接调用候选，不声称覆盖全部历史或内部调用。
 
 模板导出文件是原始模板对象；stdout 是结果信封。用 `raw.py reencode` 修改已知参数，再用 `raw.py write --template ...` 预览。不要手工拼接十六进制片段；确需按位置改写时使用带 --verify 的 raw.patch。检查原接收者、截止时间、钱包绑定签名和证明。不要复制原 Nonce、费用或签名。
 
@@ -117,3 +117,5 @@ fund_flows.refunds 是已计入流入/net 的解释性子集，不能再次扣�
 批量按列表顺序执行，默认失败停止；整批只运行一次。即使允许继续，广播状态未知的钱包同链仍停止后续写入。首版没有常驻调度、MCP 或任务恢复。
 
 完整参数、错误处理和例子见 [工具包技术参考](references/toolkit.md)，实际参数以子命令 `--help` 为准；README 只面向用户介绍如何接入 Agent。工具输出仅估算 EVM 执行费，L2 附加费用可能不在其中。
+
+处理 `broadcast_unconfirmed` 时，先用 `data.suggested_next` 的 chain/hash 等待原交易，再读写入后的余额。合约模式识别看 `patterns_status`，其中 `partial` 和 `unavailable` 表示证据不足。遇到 `DEPENDENCY_MISSING` 时用运行工具的解释器安装项目依赖。

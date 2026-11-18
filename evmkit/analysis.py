@@ -535,7 +535,7 @@ class Analyzer:
                 calltype = str(frame.get("type", "CALL")).upper()
                 target = address(frame["to"]) if frame.get("to") else None
                 execution_context = context if calltype in ("DELEGATECALL", "CALLCODE") else target
-                item = {"path": path, "type": calltype, "from": address(frame["from"]) if frame.get("from") else None, "to": target,
+                item = {"path": path, "depth": len(path), "type": calltype, "from": address(frame["from"]) if frame.get("from") else None, "to": target,
                         "execution_context": execution_context, "value_wei": str(int(frame.get("value") or "0x0", 16)),
                         "input": ashex(frame["input"]) if frame.get("input") is not None else None, "output": frame.get("output", "0x"),
                         "error": str(frame["error"])[:256] if frame.get("error") else None,
@@ -560,7 +560,7 @@ class Analyzer:
             row = {"from": loc(raw.get("from")), "to": loc(raw.get("to")), "type": raw.get("type"), "call_type": raw.get("call_type"),
                    "value_wei": str(raw.get("value", "0")), "index": raw.get("index"),
                    "input": raw.get("input"), "error": raw.get("error"), "committed": None,
-                   "decoded": None, "path": None}
+                   "decoded": None, "path": None, "depth": None}
             calltype = str(row.get("call_type") or row.get("type") or "").upper()
             row["may_carry_value"] = calltype in ("CALL", "CREATE", "CREATE2", "SELFDESTRUCT")
             row["committed"] = False if row["error"] else None
@@ -855,7 +855,8 @@ class Analyzer:
                 "capabilities": {"external_enabled": self.options["external"], "trace_enabled": self.options["trace"],
                                  "requests_used": self.budget.requests, "requests_by_stage":dict(self.budget.by_stage),
                                  "rpc_calls":self.budget.rpc_calls,"rpc_calls_by_method":dict(self.budget.rpc_by_method)}}
-        from .agent_output import suggested_next
+        from .agent_output import suggested_next, transaction_conclusion
+        output.update(transaction_conclusion(output))
         next_params={**self.params,"chain":self.chain["alias"],"hash":ashex(tx["hash"])}
         output["suggested_next"]=suggested_next(next_params,output) if warnings else []
         output["issues"]=[{"code":code,"suggested_next":output["suggested_next"]} for code in warnings]

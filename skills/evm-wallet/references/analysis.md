@@ -338,11 +338,18 @@ python address.py actions --chain bsc --address "$OWNER" --limit 50
 
 history 默认最近 50 笔，范围 1–200；direction=in/out/both，--to 可过滤目标。复用 Blockscout 的 /addresses/{address}/transactions 与 Etherscan V2 account/txlist；API Key 继续在本地 explorers.local.toml。无服务、鉴权失败、限流和真实空列表分别返回，不用普通 RPC 无限扫块。供应商可能对历史和 ABI 查询采用不同套餐权限。
 
-输出统一 hash、block_number、timestamp、from/to、value_wei、selector、status 和 reported_function；reported_function 是浏览器声明，不保证签名已确认。complete 表示该过滤范围的数据源已耗尽，status 表示本次窗口请求是否满足；next_cursor 继续分页，包括未消费完的同页记录。cursor 绑定链、地址和过滤条件，不能携带任意远程 URL。
+输出统一 hash、block_number、timestamp、from/to、value_wei、selector、status 和 reported_function；reported_function 保留浏览器原标签。resolved_function 优先使用能解码 calldata 的内置签名，其次使用浏览器标签，最后回退 selector。该字段含 name、signature、source、ambiguous、candidates。ERC-20 与 ERC-721 的 approve 共享签名，ambiguous=true 时需核对目标接口。此解析不增加网络请求。complete 表示该过滤范围的数据源已耗尽，status 表示本次窗口请求是否满足；next_cursor 继续分页，包括未消费完的同页记录。cursor 绑定链、地址和过滤条件，不能携带任意远程 URL。
 
 actions 只聚合窗口内该地址发出的直接调用候选，按目标/selector 统计 count/success/failed/unknown；目标是否合约未知时保留 null，不把任意非空 input 当作已验证合约身份。scope/limit/complete/next_cursor 必须一起报告，不代表全部生涯、token-event-only 活动或内部调用。
 
 ## transaction.plan：来源到实时预览
+
+```bash
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --include-inputs
+python transaction.py plan --chain sepolia --hash "$TX_HASH" --address "$ACCOUNT"
+```
+
+wallet 和 address 是可选且互斥的发送者。仅给链与交易哈希时，`status=template_only`、`preview=null`、`simulation.status=skipped`，并返回 `SIMULATION_SKIPPED_NO_SENDER`。原收件人保留，可应用已有可靠依据的显式改写。recipient:self 或需要核对调用者的改写缺发送者时，返回 SENDER_REQUIRED 并保留已取得的候选与模板。多候选继续显式选择。公开地址与无发送者模式无需在 CLI 或 SDK 加载钱包密钥。
 
 ```bash
 python transaction.py plan --chain base --hash "$TX_HASH" --wallet trading --abi erc20 \
@@ -353,9 +360,9 @@ python transaction.py plan --chain bsc --hash "$TX_HASH" --wallet trading --abi 
 
 第一例是 ERC-20 transfer 的最小单位简写，第二例是 Router 的明确参数名。override.args 支持完整数组或唯一顶层名称对象；tuple/数组参数通过完整顶层值替换，value_wei 单独覆盖。amount 简写只接受能唯一确定主要输入的标准接口，歧义或重复覆盖拒绝。
 
-沿用 template_safe 规则，只有显式/已确认 ABI 才可编辑参数；已确认标准受益人改为选定钱包并展示 parameter_diff，显式 override 可覆盖。owner、钱包绑定证明/签名、deadline 不自动重写；显式 deadline 覆盖单独处理，未知 calldata 默认原样或经显式字段映射改写后强制模拟。源码/接口模式未确认时可明确传 ABI/signature，不将猜测直接转为可执行模板。
+沿用 template_safe 规则，只有显式/已确认 ABI 才可编辑参数；提供发送者时，已确认标准受益人改为该地址并展示 parameter_diff，显式 override 可覆盖。owner、钱包绑定证明/签名、deadline 不自动重写；显式 deadline 覆盖单独处理，未知 calldata 可原样提取，或经显式字段映射改写。提供发送者后可实时模拟改写结果。源码/接口模式未确认时可明确传 ABI/signature，不将猜测直接转为可执行模板。
 
-输出 template、parameter_diff、preview、source_status、template_safe 和 warnings。实时读取 pending Nonce、余额、费用并模拟、估价，不复制原 Nonce/Gas/费用，不预留 Nonce，不写广播意图。使用观察钱包地址也能预览；若仅配置私钥变量则在本地派生地址，绝不输出或外传密钥。此命令不接受 execute/skip_simulation/nonce，不能广播。模拟或余额检查失败时 ok=false、data.status=blocked，仍保留 template/diff 和 suggested_next。
+输出 template、parameter_diff、preview、source_status、template_safe 和 warnings。指定发送者时实时读取 pending Nonce、余额、费用并模拟、估价，不复制原 Nonce/Gas/费用，不预留 Nonce，不写广播意图。使用观察钱包地址也能预览；若仅配置私钥变量则在本地派生地址，绝不输出或外传密钥。此命令不接受 execute/skip_simulation/nonce，不能广播。模拟或余额检查失败时 ok=false、data.status=blocked，仍保留 template/diff 和 suggested_next。
 
 ## 内部原始 input 与输出开关
 
@@ -555,3 +562,11 @@ BSC 单跳样本实测：冷分析 9.51 秒，34 次增强 HTTP / 37 个逻辑 R
 ## 合约地址分析的分工
 
 给交易 hash 仍使用 transaction.analyze；给合约地址、需要展开代理/状态/源码线索或检查退出前提时，使用 contract.introspect / contract.diagnose。两者不替换资金流分析，也不自动接管广播。详见 [合约分析参考](introspect.md)，新增机器帮助与默认 summary 的边界在该文档中说明。
+
+## 结论字段、调用深度与 word 提示
+
+full 和 summary 共用 status、intent、intent_confidence、net、got、fee 与 fund_flows。摘要超出 2048 UTF-8 字节时可省略字段并标 truncated，保留的结论值与 full 一致。旧分析快照返回时会补齐结论。
+
+callTracer 的 depth 等于 path 长度，根调用为 0。编码声明和没有层级的浏览器列表返回 depth=null。path: 定位真实路径，execution:N 定位编码声明序号。
+
+展开 include-inputs 时，缺可靠 ABI 的输入可附 word_hints。报告最多检查 128 个完整 word，保留扫描数、截断、尾部字节和本机 UTC 参考时间。word_index 从 selector 后的第一格开始。同一格可列出多个低置信度解释，包括高位零填充的疑似地址、接近参考时钟的疑似时间戳和原始整数数量级。已知交易或调用地址的相等关系写入 matches。提示不添加代币精度或 deadline 语义，也不会驱动参数编辑。原始输入字节始终完整。

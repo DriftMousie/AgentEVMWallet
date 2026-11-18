@@ -27,7 +27,8 @@ python contract.py diagnose --chain arbitrum --address "$CONTRACT" \
 | probes | 地址、完整签名、args、caller、区块、状态、raw、values/named_values |
 | relations | 节点、角色、代码与验证信息、带 getter 证据的边和截断说明 |
 | semantics | 源码定义中的修饰符、require、成员/内部候选调用与文件/行号证据；不可用时 null |
-| patterns / verdict | diagnose 的匹配依据、退出候选、检查、阻断和未知项 |
+| patterns / patterns_status | 两个命令的模式匹配结果与完整度，full 含签名与关系证据 |
+| verdict | diagnose 的退出候选、检查、阻断和未知项 |
 | block / checked_at | 固定区块号、哈希、规范性检查和检查时间 |
 | components / issues / enhancements_missing | 各组件完整度、结构化问题和可选来源缺失 |
 | capabilities | HTTP/RPC 子调用数量、预算和省略探测数 |
@@ -115,3 +116,7 @@ ABI_UNAVAILABLE/ABI_REQUIRED：检查验证源是否启用、有无权限、实�
 公开 Arbitrum 样本在默认预算下完成两层代理/有效 ABI 发现、主文件源码线索和 GToken 模式诊断；Core 的暂停、上市及现金检查可读。Validator 实现的验证信息不可得，源码中的非 view 通知路径也未执行；未提供账户时余额和资格保持未知、entry=null。原稿中的历史现金数值未当作固定期望值。
 
 实链仅用临时配置和公共只读接口，发送接口被禁用。另以合成数据验证 ERC-4626 三档结论、升级不变代理代码、批量降级、规则扩展、源码/规则处理和摘要边界；开发测试及真实样本细节不入仓库。
+
+introspect 展示模式证据，diagnose 进一步检查退出前提。patterns_status=complete 时空数组代表没有匹配当前证据的模式。partial 或 unavailable 表示 ABI、关系、预算或快照证据不足。
+
+模式命令需要 PyYAML。已有环境若返回 DEPENDENCY_MISSING，请用运行工具的同一个 Python 执行 `python -m pip install -r requirements.txt`。静态帮助仍可读取。

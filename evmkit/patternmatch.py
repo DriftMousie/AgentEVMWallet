@@ -85,15 +85,55 @@ def load_patterns():
     return definitions
 
 
-def match_patterns(abi,relations,requested='auto'):
-    definitions=load_patterns();require(requested=='auto' or requested in [d['id'] for d in definitions],'Unknown protocol pattern')
-    signatures={canonical(i) for i in abi or [] if i.get('type')=='function'};found=[]
+def matching_interfaces(abi, requested):
+    definitions = load_patterns()
+    require(requested == 'auto' or requested in [d['id'] for d in definitions], 'Unknown protocol pattern')
+    signatures = {canonical(i) for i in abi or [] if i.get('type') == 'function'}
     for definition in definitions:
-        if requested!='auto' and definition['id']!=requested:continue
-        rules=definition['match'];all_=rules.get('functions_all',[]);any_=rules.get('functions_any',[]);rels=rules.get('relations_all',[])
-        if set(all_)<=signatures and (not any_ or set(any_)&signatures) and all(relations.get(r) for r in rels):
-            found.append({'id':definition['id'],'label':definition.get('label'),'evidence':{'functions':sorted(set(all_)|(set(any_)&signatures)),'relations':{r:relations[r] for r in rels}},'definition':definition})
+        if requested != 'auto' and definition['id'] != requested:
+            continue
+        rules = definition['match']
+        required = set(rules.get('functions_all', []))
+        alternatives = set(rules.get('functions_any', []))
+        if required <= signatures and (not alternatives or alternatives & signatures):
+            yield definition, sorted(required | (alternatives & signatures))
+
+
+def pattern_hit(definition, functions, relations):
+    return {'id':definition['id'], 'label':definition.get('label'),
+            'evidence':{'functions':functions, 'relations':relations}, 'definition':definition}
+
+
+def match_patterns(abi,relations,requested='auto'):
+    found = []
+    for definition, functions in matching_interfaces(abi, requested):
+        names = definition['match'].get('relations_all', [])
+        if all(relations.get(name) for name in names):
+            found.append(pattern_hit(definition, functions, {name:relations[name] for name in names}))
     return found
+
+
+def inspect_patterns(inspector, root, requested='auto'):
+    """Match verified interfaces using the inspector's pinned-block relation probes."""
+    abi = inspector.abi(root)
+    found = []
+    status = 'complete' if abi is not None else 'unavailable'
+    relations = {}
+    from .introspect import ZERO
+    for definition, functions in matching_interfaces(abi, requested):
+        names = definition['match'].get('relations_all', [])
+        if abi is None:
+            continue
+        for name in names:
+            if name not in relations:
+                relations[name] = inspector.relation(root, name)
+            if relations[name] is None:
+                probe = inspector.probes.get(inspector.probe_key(root, f'{name}()', []), {})
+                if probe.get('status') != 'success' or probe.get('values') != [ZERO]:
+                    status = 'partial'
+        if all(relations[name] for name in names):
+            found.append(pattern_hit(definition, functions, {name:relations[name] for name in names}))
+    return found, status, relations
 
 
 def expression(value,bindings,depth=0,counter=None):

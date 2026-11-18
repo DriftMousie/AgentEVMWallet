@@ -16,6 +16,57 @@ def input_fields(row):
     return {"selector":raw[:10] if len(raw)>=10 else None,"input_bytes":(len(raw)-2)//2,"input_available":True}
 
 
+def call_depth(row):
+    path = row.get("path")
+    return len(path) if isinstance(path, list) else None
+
+
+def annotate_words(raw, address_roles, now):
+    """Describe possible word layouts without inferring parameter semantics."""
+    payload = hexdata(raw)[10:]
+    total = len(payload) // 64
+    scanned = min(total, 128)
+    hints = []
+    for index in range(scanned):
+        word = payload[index * 64:(index + 1) * 64]
+        value = int(word, 16)
+        interpretations = []
+        if word[:24] == "0" * 24 and value:
+            candidate = "0x" + word[24:]
+            roles = address_roles.get(candidate, [])
+            if roles or value >= 2**96:
+                interpretations.append({"kind":"address_candidate", "address":address(candidate), "matches":roles})
+        if value >= 1_000_000_000 and abs(now - value) <= 365 * 86400:
+            interpretations.append({"kind":"timestamp_candidate", "delta_seconds": now - value})
+        if 10**15 <= value < 10**30:
+            interpretations.append({"kind":"amount_magnitude_candidate"})
+        if interpretations:
+            hints.append({"word_index":index, "byte_offset":4 + index * 32, "word":"0x" + word,
+                          "value_raw":str(value), "confidence":"low", "interpretations":interpretations})
+    return {"items":hints, "words_scanned":scanned, "full_words":total,
+            "truncated":total > scanned, "trailing_bytes":len(payload) % 64 // 2,
+            "reference_timestamp":now, "clock_source":"local_utc_clock"}
+
+
+def input_address_roles(transaction, row):
+    roles = {}
+    for role, value in (("transaction_sender", transaction.get("from")),
+                        ("transaction_target", transaction.get("to")),
+                        ("call_sender", row.get("from")), ("call_target", row.get("to"))):
+        if isinstance(value, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", value):
+            roles.setdefault(value.lower(), []).append(role)
+    return roles
+
+
+def expanded_input(row, transaction, now):
+    raw = row.get("input")
+    fields = {"input_raw":raw}
+    decoded = row.get("decoded") or {}
+    if isinstance(raw, str) and len(raw) >= 74 and not decoded.get("template_safe") and decoded.get("status") not in {"onchain_message", "data_only"}:
+        fields["word_hints"] = annotate_words(raw, input_address_roles(transaction, row), now)
+    return fields
+
+
 def patch_word(data,word,value,type_="bytes32"):
     data=hexdata(data);word=uint(word,"zero-based word index")
     require(type_ in ("address","uint256","bytes32"),"type must be address, uint256 or bytes32")

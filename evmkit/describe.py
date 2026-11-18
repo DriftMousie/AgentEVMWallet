@@ -7,7 +7,7 @@ def describe(module,operation):
     from .operations import OPS
     from .common import require
     require((module,operation) in SUPPORTED,"Machine descriptions are available for analyze/plan, history/actions and raw patch")
-    required={"analyze":["chain","hash"],"plan":["chain","hash","wallet"],"history":["chain","address"],"actions":["chain","address"],"patch":["chain","to","data","word","value","verify"]}[operation]
+    required={"analyze":["chain","hash"],"plan":["chain","hash"],"history":["chain","address"],"actions":["chain","address"],"patch":["chain","to","data","word","value","verify"]}[operation]
     booleans={"external","trace","require_trace","no_cache","include_inputs","verify"}
     numbers={"limit","time_budget_seconds","max_requests","max_frames","max_depth","max_pages","max_tokens","max_addresses","word","take_candidate"}
     arrays={"tokens","addresses"}
@@ -20,7 +20,9 @@ def describe(module,operation):
         if field=="limit": row.update(minimum=1,maximum=200,default=50)
         if field=="max_requests": row["default"]=300
         if field=="time_budget_seconds": row["default"]=60
-        if field=="include_inputs":row.update(default=False,description="Full raw inputs and legacy input aliases; incompatible with summary view")
+        if field=="include_inputs":row.update(default=False,description="Full raw inputs and low-confidence word hints when no reliable ABI is available; incompatible with summary view")
+        if operation=="plan" and field in ("wallet","address"):
+            row["description"] = "Optional simulation sender. Choose either wallet or address. With neither, return a template without simulation."
         if field=="verify":row["const"]=True
         if field=="word":row.update(minimum=0,description="Zero-based 32-byte word AFTER the 4-byte selector")
         if field=="type":row.update(enum=["address","uint256","bytes32"],default="bytes32")
@@ -35,13 +37,15 @@ def describe(module,operation):
                         "recipient":{"type":"string","description":"self or a full address; unique ABI/mapped fields or confirmed caller-owned lock creation"},"deadline":{"type":"string","pattern":"^(?:[0-9]+|now\\+[0-9]+)$"},
                         "tokenId":{"type":"string","pattern":"^(?:[0-9]+|auto)$","description":"Explicit ABI tokenId, or auto only for supported contract-assigned-ID creation interfaces"}},additionalProperties=False)
         properties[field]=row
-    use={"analyze":"Explain observed assets, input, logs and risks for a transaction hash", "plan":"Prepare a reference transaction for a selected local wallet and simulate it without broadcasting",
+    use={"analyze":"Explain observed assets, input, logs and risks for a transaction hash", "plan":"Prepare a template from a reference transaction and optionally simulate from a wallet or public address",
          "history":"Read a bounded explorer window of normal transactions for an address", "actions":"Aggregate recent outgoing direct call targets and selectors",
          "patch":"Replace exactly one whole calldata word and eth_call it from an explicit sender; never broadcasts"}[operation]
     schema={"type":"object","properties":properties,"required":required,"additionalProperties":False}
     if operation=="patch":schema["oneOf"]=[{"required":["wallet"],"not":{"required":["address"]}},{"required":["address"],"not":{"required":["wallet"]}}]
     if operation=="analyze":schema["not"]={"properties":{"view":{"const":"summary"},"include_inputs":{"const":True}},"required":["view","include_inputs"]}
-    if operation=="plan":schema["not"]={"required":["take_call","take_candidate"]}
+    if operation=="plan":
+        schema["not"] = {"required":["take_call","take_candidate"]}
+        schema["allOf"] = [{"not":{"required":["wallet","address"]}}]
     return {"schema_version":1,"operation":module+"."+operation,"when_to_use":[use],
             "when_not_to_use":["Do not infer chain from hash", "Do not interpret event flows as all token storage changes"] if operation=="analyze" else
                               ["Not for signing or broadcasting", "Simulation does not prove intended semantics"] if operation in ("plan","patch") else ["Not for exhaustive lifetime/internal-call history"],
@@ -63,6 +67,7 @@ def describe(module,operation):
 
 def contract_describe(operation):
     from .operations import OPS
+    from pathlib import Path
     from .introspect import LIMITS
     properties={}
     for field in sorted(OPS['contract'][operation]):
@@ -76,8 +81,8 @@ def contract_describe(operation):
         elif field=='view':row.update(enum=['summary','full'],default='summary')
         elif field=='amount_unit':row.update(enum=['shares','assets'],default='shares')
         elif field=='pattern':
-            from .patternmatch import ROOT
-            row.update(enum=['auto']+[p.stem for p in sorted(ROOT.glob('*.yaml'))],default='auto')
+            pattern_dir = Path(__file__).with_name("patterns")
+            row.update(enum=['auto']+[p.stem for p in sorted(pattern_dir.glob('*.yaml'))],default='auto')
         properties[field]=row
     constraints=[{'not':{'properties':{'view':{'const':'summary'},'include_source':{'const':True}},'required':['include_source']}}]
     if operation=='diagnose':constraints.append({'not':{'required':['amount','amount_raw']}})

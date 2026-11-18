@@ -2,15 +2,51 @@
 import base64
 import hashlib
 import json
+import re
+from functools import lru_cache
+from .abi import canonical, decode_call, selector as function_selector
 from .analysis import settings
 from .common import ToolError,address,hexdata,require,txhash,uint
 from .explorers import Sources
 from .network import Budget
+from .standards import entries
 
 
 def _location(value):
     value=value.get("hash") if isinstance(value,dict) else value
     return address(value) if value else None
+
+
+@lru_cache(maxsize=1)
+def standard_selectors():
+    index = {}
+    for entry in entries("function"):
+        signature = canonical(entry["abi"])
+        signatures = index.setdefault(function_selector(signature), {})
+        signatures.setdefault(signature, set()).update(entry["standards"])
+    return index
+
+
+def history_function(raw, reported):
+    selector = raw[:10] if raw and len(raw) >= 10 else None
+    if selector is None:
+        return None
+    candidates = []
+    for signature, standards in sorted(standard_selectors().get(selector, {}).items()):
+        try:
+            decode_call(raw, signature)
+        except ToolError:
+            continue
+        candidates.append({"signature":signature, "standards":sorted(standards)})
+    if candidates:
+        signature = candidates[0]["signature"] if len(candidates) == 1 else None
+        return {"name":signature.split("(")[0] if signature else selector, "signature":signature,
+                "source":"builtin", "ambiguous":len(candidates) != 1 or len(candidates[0]["standards"]) > 1,
+                "candidates":candidates}
+    if reported and re.match(r"^[A-Za-z_]\w*(?:\(|$)", reported):
+        return {"name":reported.split("(")[0], "signature":None,
+                "source":"explorer", "ambiguous":None, "candidates":[]}
+    return {"name":selector, "signature":None, "source":"selector", "ambiguous":None, "candidates":[]}
 
 
 def normalize(row, provider):
@@ -23,12 +59,14 @@ def normalize(row, provider):
     elif status=="ok": status="success"
     elif status=="error": status="reverted"
     to_info=row.get("to")
+    reported = row.get("method") or row.get("functionName")
+    reported = str(reported)[:160] if reported else None
     return {"hash":txhash(row["hash"]),"block_number":str(row.get("block_number",row.get("blockNumber",""))),
             "timestamp":row.get("timestamp",row.get("timeStamp")),"from":source,"to":destination,
             "value_wei":str(uint(row.get("value","0"))),"selector":raw[:10] if raw and len(raw)>=10 else None,
             "data_bytes":(len(raw)-2)//2 if raw is not None else None,"status":status or "unknown",
             "target_is_contract":to_info.get("is_contract") if isinstance(to_info,dict) else None,
-            "reported_function":str(row.get("method",row.get("functionName","")))[:160] or None}
+            "reported_function":reported, "resolved_function":history_function(raw, reported) if destination else None}
 
 
 def _encode(value): return base64.urlsafe_b64encode(json.dumps(value,separators=(",",":")).encode()).decode()

@@ -47,7 +47,7 @@ def declared_calls(transaction,chain,limit=1000):
         if mode!="0x"+"00"*32 or len(raw)<52:
             out["unsupported_executions"].append(i);out["status"]="partial";continue
         target=address("0x"+raw[:20].hex());input_="0x"+raw[52:].hex()
-        out["calls"].append({"source":"encoded_execution","execution_index":i,"path":None,"type":"CALL","from":None,
+        out["calls"].append({"source":"encoded_execution","execution_index":i,"path":None,"depth":None,"type":"CALL","from":None,
                              "to":target,"execution_context":None,"value_wei":str(int.from_bytes(raw[20:52],"big")),"input":input_,
                              "selector":input_[:10] if len(input_)>=10 else None,"input_bytes":len(raw)-52,
                              "committed":None,"execution_observed":False,"payload_unverified":True})

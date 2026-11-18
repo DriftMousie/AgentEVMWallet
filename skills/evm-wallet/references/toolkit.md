@@ -297,7 +297,7 @@ response = transfer.run({"chain": "base", "wallet": "trading", "to": "0x00000000
 | not_broadcast | SIMULATION_REVERTED | 模拟或估 Gas 明确回退；phase 区分 simulation/gas_estimation |
 | signed_not_broadcast | JOURNAL_SAVE_FAILED 或发送前节点不可用 | hash 已计算但未尝试广播；修复记录/连接后先核查原 hash |
 | broadcast_unknown | BROADCAST_UNKNOWN | 尝试发送，结果未知；先查原 hash，不自动重发 |
-| broadcast_unconfirmed | CONFIRMATION_TIMEOUT / CONFIRMATION_UNAVAILABLE | 超时或回执/规范块查询失败，不代表执行回退 |
+| broadcast_unconfirmed | 无，或 CONFIRMATION_TIMEOUT / CONFIRMATION_UNAVAILABLE | 已广播后尚未等待、超时或确认查询失败 |
 | confirmed | 无 | 规范链回执 status=1 且满足确认要求 |
 | reverted | EXECUTION_REVERTED | 规范链回执 status=0 且满足确认要求 |
 | partial_execution | 具体步骤错误 | 复合操作部分完成；transactions 和 completed_steps 保留每步身份 |
@@ -380,3 +380,7 @@ python contract.py diagnose --chain arbitrum --address "$CONTRACT" \
 functions/encode 仍支持原来的显式 ABI 调用；自动模式需要 chain/contract 和可用验证源。call 标准 ERC-20 读取保留本地接口，其他函数可发现有效 ABI，但自动调用仅 view/pure。显式 ABI 的原手工 eth_call 行为不变；write 不自动取 ABI 或扩大授权。
 
 新增 PyYAML==6.0.3 已锁定，使用受限安全加载，仅加载工具包模式文件。根 RPC/区块失败返回错误；可选来源/源码/单项状态失败保留结构和 unknown。code_hash 只隔离静态材料，升级指针和状态不能缓存。用户材料中的历史现金/汇率不是实时验收常量。
+
+写入命令使用 `--execute --wait` 会按链配置等待确认。显式 `--confirmations 1` 等待一次确认。默认发送后立即返回 `broadcast_unconfirmed`，按 `data.suggested_next` 中的 chain/hash 查询原交易，再读取余额或发送依赖交易。
+
+`transaction.plan` 支持仅给链和 hash 提取模板，或用 `--address` / `--wallet` 指定一个发送者模拟。诊断返回 `DEPENDENCY_MISSING` 时按提示在当前 Python 安装依赖。意外错误可能附 `exception_type` 与仓库内的 `exception_at`，供定位问题。

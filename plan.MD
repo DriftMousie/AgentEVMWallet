@@ -237,7 +237,7 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 - 加入 DelegationManager/ERC-1271 模式和链级管理器配置。7702 组合代码、prestate、trace、授权意图等证据，区分历史范围、candidate/observed，不把普通签名验证或已委托发送者等同于实际委托执行。
 - 已知管理器全零 ERC-7579 single CALL 解包到独立 declared_calls，无 trace 也可提供声明中的目标/value/完整 payload；不伪造 path/执行状态，不计入资金流。外层照抄默认阻止。
 - plan.take-call 支持完整地址:selector、精确 path、execution:N；多匹配拒绝，partial trace 不自动取第一条。只取普通已生效 CALL 或明确受支持声明，从自己的钱包实时模拟；ABI 作用于选中调用。
-- 语义 recipient/self、deadline/now+秒在可靠 ABI 或明确 typed field_map 下实现。按完整 word 的未知映射标 payload_unverified，强制模拟；不猜 packed/dynamic 结构，不自动改 owner/证明/签名。
+- 语义 recipient/self、deadline/now+秒在可靠 ABI 或明确 typed field_map 下实现。按完整 word 的未知映射标 payload_unverified，有发送者时运行模拟（见第 16 节）；不猜 packed/dynamic 结构，不自动改 owner/证明/签名。
 - timing 识别明确时间字段，分析按本机 UTC、缓存命中重算；plan 相对时间使用最新区块。特殊值/未知单位不猜，过期标风险，不直接丢掉原始数据。
 - raw.patch 只替换 selector 后零基 word，显式 address/uint256/bytes32，必须 verify 和完整上下文；无 execute，不广播，失败保留 diff/data/revert details。
 - fund_flows.refunds 单列 confirmed/refund_candidate，附交易内位置与区块日志索引，不凭微小数量判断，不重复扣 net。全部 Markdown、help/describe 同步；真实样本和测试只留临时目录，不发布用户交易/钱包材料。
@@ -265,3 +265,12 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 - amount 默认 shares，人类/原始单位互斥；assets 显式选择，缺精度不猜。退出结论 likely_yes/unknown/likely_no 与结构完整度分开，缺账户/金额不产完整 calldata，非 view 闸门和未覆盖外部通知保留 blocker 级未知；毛额不是净到账。
 - 默认 60 秒/150 HTTP/50 探测/10 节点/4 跳/1 源文件；固定区块末检查规范性，预算不足保留结构和未知项。所有新诊断不加载钱包私钥、模拟非 view 退出、签名或广播。
 - 新增合约分析参考，更新 README/Skill/现有参考与设计稿；测试及真实样本明细留临时目录。gDAI 只读检验使用当轮区块，不固定历史现金和费率，也不声称完成资金退出。
+
+
+## 16. 预览输入、分析字段与诊断反馈修订
+
+- plan 支持无发送者模板和公开地址模拟。发送者参数互斥。缺发送者时原收件人保留，模拟状态为 skipped，self 改写给出 SENDER_REQUIRED。
+- CLI/SDK 提前报告模式依赖缺失，意外异常附安全类型与代码位置。已取得的候选、模板和执行记录继续可见。
+- full/summary 共用资金结论，旧缓存补齐。历史记录增加内置签名候选及歧义，真实 trace 带 depth，声明及无层级列表保留未知深度。
+- introspect 与 diagnose 共用模式匹配，patterns_status 说明证据完整度。include-inputs 可展开低置信度 word 提示，保持原始输入且不参与改写。
+- 已广播未确认的写入输出带原 hash 的等待建议。CLI 和 Agent 文档说明 wait、确认数与余额读取顺序。

@@ -2,7 +2,7 @@
 import re
 from .abi import canonical,encode_call,resolve
 from .common import ToolError,formatted,require,uint,units
-from .patternmatch import expression,match_patterns
+from .patternmatch import expression, inspect_patterns
 
 
 def single(row):
@@ -22,25 +22,31 @@ def diagnose_contract(inspector,root,sem):
     p=inspector.params;unit=p.get('amount_unit','shares');require(unit in ('shares','assets'),'amount_unit must be shares or assets')
     require(p.get('amount') is None or p.get('amount_raw') is None,'Use amount or amount_raw, not both')
     bindings={'root':root,'account':inspector.account,'amount_raw':None}
-    for name in ('core','asset','underlying'):bindings[name]=inspector.relation(root,name)
-    found=match_patterns(inspector.abi(root),bindings,p.get('pattern','auto'))
+    found, patterns_status, relations = inspect_patterns(inspector, root, p.get('pattern', 'auto'))
+    bindings.update(relations)
     patterns=[{k:v for k,v in f.items() if k!='definition'} for f in found]
     verdict={'question':'can_redeem','answer':'unknown','confidence':'low','scope':'supported_read_only_preconditions_not_execution_or_audit','entry':None,'checks':[],
              'estimated_out':None,'blockers':[],'unknowns':[]}
-    result={'patterns':patterns,'verdict':verdict}
+    result={'patterns':patterns,'patterns_status':patterns_status,'verdict':verdict}
     def add(id,status='unknown',severity='blocker',**extra):
         row={'id':id,'status':status,'severity':severity,**extra};verdict['checks'].append(row)
         if status=='fail' and severity=='blocker':verdict['blockers'].append(row)
         elif status!='pass':verdict['unknowns'].append(row)
         return row
     if len(found)!=1:
-        add('pattern',reason='no_matching_verified_interface' if not found else 'multiple_patterns_need_explicit_selection');return result
+        reason = 'pattern_evidence_incomplete' if patterns_status != 'complete' else 'no_matching_verified_interface'
+        add('pattern',reason=reason if not found else 'multiple_patterns_need_explicit_selection');return result
+    if patterns_status != 'complete':
+        add('pattern', reason='pattern_evidence_incomplete')
     definition=found[0]['definition']
     def dispatch_known(target):
         structure=inspector.structure(target)
         return structure['resolution_status']=='complete' and all(layer.get('verified') is True or layer.get('pointer_evidence') in ('exact_runtime_pattern','delegation_marker') for layer in structure['layers'])
     if not dispatch_known(root):add('proxy_dispatch',reason='unverified_or_unconfirmed_proxy_dispatch')
-    asset=bindings.get(definition['asset_binding'])
+    asset_binding = definition['asset_binding']
+    if asset_binding not in bindings:
+        bindings[asset_binding] = inspector.relation(root, asset_binding)
+    asset=bindings.get(asset_binding)
     decimals_target=root if unit=='shares' else asset
     decimals=unsigned(inspector.read(decimals_target,'decimals()')) if decimals_target else None
     if p.get('amount_raw') is not None:bindings['amount_raw']=str(uint(p['amount_raw'],'amount_raw'))

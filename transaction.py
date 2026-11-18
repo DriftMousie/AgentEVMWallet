@@ -7,4 +7,5 @@ else:
         from evmkit.config import Config
         from evmkit.operations import Toolkit
         readonly={"analyze","decode","inspect","status","wait","gas","export-template"}
-        return Toolkit(config or Config(load_wallets=operation not in readonly)).run("transaction", operation, params)
+        senderless_plan = operation == "plan" and (not isinstance(params, dict) or not params.get("wallet"))
+        return Toolkit(config or Config(load_wallets=operation not in readonly and not senderless_plan)).run("transaction", operation, params)

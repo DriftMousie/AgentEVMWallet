@@ -8,6 +8,11 @@ def suggested_next(params, data=None, code=None):
     data=data if isinstance(data,dict) else {}
     chain,hash_=params.get("chain"),data.get("hash") or params.get("hash")
     steps=[]
+    if code == "DEPENDENCY_MISSING":
+        steps.append({"action":"install_project_dependencies", "command":"python -m pip install -r requirements.txt",
+                      "reason":"Use the same Python interpreter that runs the toolkit"})
+    if code == "SENDER_REQUIRED":
+        steps.append({"action":"supply_plan_sender", "reason":"Provide a public address or a configured wallet for sender-dependent overrides"})
     if code in ("RPC_UNAVAILABLE","CANONICALITY_UNAVAILABLE") and chain and params.get("address") and not hash_:
         steps.append({"module":"contract","operation":"introspect","params":{"chain":chain,"address":params['address'],"view":"summary","no_cache":True},"reason":"Restore a working RPC, then retry this read-only pinned-block analysis"})
     if code in ("ABI_REQUIRED","ABI_UNAVAILABLE") and chain and (params.get("contract") or params.get("address")):
@@ -68,14 +73,37 @@ def _quantity(raw,decimals,symbol,location=None):
     return ("+" if value>0 else "-" if value<0 else "")+text+" "+label
 
 
+def transaction_conclusion(original, default_status="partial"):
+    """Build the same user-facing totals for all analysis output views."""
+    flows = original.get("fund_flows", {})
+    native = flows.get("native", {})
+    classification = original.get("classification", {})
+    inferred = classification.get("inferred_intent") or {}
+    tokens, nfts = flows.get("tokens", []), flows.get("nfts", [])
+    net=[];got=[]
+    if native.get("net_wei") is not None and int(native["net_wei"])!=0:
+        target=net if int(native["net_wei"])>0 else got
+        target.append(_quantity(-int(native["net_wei"]),native["decimals"],native.get("symbol")))
+    for row in tokens:
+        value=int(row["net"])
+        if value: (got if value>0 else net).append(_quantity(value,row.get("decimals"),row.get("symbol"),row["address"]))
+    for row in nfts:
+        value=int(row["net"])
+        if value: (got if value>0 else net).append(("+" if value>0 else "-")+str(abs(value))+" NFT #"+row["token_id"]+" @"+row["address"])
+    status=original.get("analysis_status", default_status)
+    return {"status":status,
+          "intent":inferred.get("value") if classification.get("type") in (None,"unknown","contract_call") else classification["type"],
+          "intent_confidence":inferred.get("confidence") or classification.get("confidence"),
+          "net":"; ".join(net) if net else None,"got":"; ".join(got) if got else None,
+          "fee":_quantity(native["fee_wei"],native["decimals"],native.get("symbol")) if native.get("fee_wei") is not None else None}
+
+
 def summary_envelope(response):
     """Bound the complete serialized CLI envelope, including its trailing newline."""
     original=response.get("data") or {}
     original=original if isinstance(original,dict) else {}
     flows=original.get("fund_flows",{})
     native=flows.get("native",{})
-    classification=original.get("classification",{})
-    inferred=classification.get("inferred_intent") or {}
     tokens=flows.get("tokens",[]);nfts=flows.get("nfts",[])
     refunds=flows.get("refunds",[])
     decoded=original.get("input_decode",{})
@@ -88,22 +116,11 @@ def summary_envelope(response):
     unknowns.extend(dict.fromkeys(str(w) for w in original.get("warnings",[])+response.get("warnings",[])))
     unknowns.extend(dict.fromkeys(e["capability"]+":"+e["reason"] for e in original.get("enhancements_missing",[])))
     risks=sorted(original.get("risks",[]),key=lambda r:{"critical":0,"high":1,"warning":2,"medium":3,"info":4}.get(r.get("severity"),5))
-    net=[];got=[]
-    if native.get("net_wei") is not None and int(native["net_wei"])!=0:
-        target=net if int(native["net_wei"])>0 else got
-        target.append(_quantity(-int(native["net_wei"]),native["decimals"],native.get("symbol")))
-    for row in tokens:
-        value=int(row["net"])
-        if value: (got if value>0 else net).append(_quantity(value,row.get("decimals"),row.get("symbol"),row["address"]))
-    for row in nfts:
-        value=int(row["net"])
-        if value: (got if value>0 else net).append(("+" if value>0 else "-")+str(abs(value))+" NFT #"+row["token_id"]+" @"+row["address"])
-    status=original.get("analysis_status","failed" if not response["ok"] else "partial")
-    body={"view":"summary","status":status,"analysis_status":status,
-          "intent":inferred.get("value") if classification.get("type") in (None,"unknown","contract_call") else classification["type"],
-          "intent_confidence":inferred.get("confidence") or classification.get("confidence"),
-          "net":"; ".join(net) if net else None,"got":"; ".join(got) if got else None,
-          "fee":_quantity(native["fee_wei"],native["decimals"],native.get("symbol")) if native.get("fee_wei") is not None else None,
+    conclusion = {key: original[key] for key in ("status", "intent", "intent_confidence", "net", "got", "fee")
+                  if key in original}
+    if len(conclusion) != 6:
+        conclusion = transaction_conclusion(original, "failed" if not response["ok"] else "partial")
+    body={"view":"summary", **conclusion, "analysis_status":conclusion["status"],
           "fee_scope":"EVM execution only",
           "fund_flows":{"status":flows.get("status","unavailable"),"focus_address":flows.get("focus_address"),
                         "native":{k:native.get(k) for k in ("net_wei","fee_wei","balance_delta_wei")},
@@ -122,11 +139,11 @@ def summary_envelope(response):
     buckets=[body["refunds"],body["fund_flows"]["tokens"],body["fund_flows"]["nfts"],body["unknowns"],body["risks"]]
     while size()>2048:
         body["truncated"]=True
-        if body["net"] is not None or body["got"] is not None:
-            body["net"],body["got"]=None,None;continue
         bucket=next((b for b in buckets if b),None)
         if bucket is not None: bucket.pop();continue
-        body["fee"]=None
+        if body.get("net") is not None or body.get("got") is not None:
+            body.pop("net", None);body.pop("got", None);continue
+        body.pop("fee", None)
         if error: error["message"]="See full view for error details"
         if size()>2048:
             body={k:body[k] for k in ("view","status","analysis_status","intent","risk_count","unknowns_count","token_count","nft_count","refund_count","truncated","next")}

@@ -8,6 +8,7 @@ import sys
 from .common import ToolError, jsonable, result, require, wallet_selectors
 from .config import Config
 from .operations import OPS, Toolkit
+from .error_details import diagnostic_error
 
 JSON_FIELDS = {"args", "items", "tokens", "wallets", "addresses", "token_ids", "quantities", "topics", "output_types", "override", "field_map","functions"}
 BOOL_FIELDS = {"execute", "wait", "skip_simulation", "unlimited", "zero_first", "all", "approved", "continue_on_error", "include_unconfirmed", "external", "trace", "require_trace", "explorer", "no_cache", "include_inputs", "verify","auto","include_source"}
@@ -75,6 +76,10 @@ def main(module, argv=None):
                 kwargs["help"] = "Integer wei per gas, NOT gwei (1 gwei = 1000000000 wei)"
             if field == "require_trace": kwargs["help"] = "Require both callTracer and prestateTracer diff; optional source failures otherwise do not lower core status"
             if field == "explorer": kwargs["help"] = "Probe configured explorer APIs too (read-only, consumes provider quota)"
+            if field == "execute" and "wait" in fields:
+                kwargs["help"] = "Broadcast the transaction. Add --wait to obtain a confirmed receipt (chain default, or --confirmations 1)."
+            if field == "wait":
+                kwargs["help"] = "Wait for confirmation. Without this flag a successful broadcast returns broadcast_unconfirmed."
             sub.add_argument("--" + field.replace("_", "-"), **kwargs)
     try:
         opts = vars(parser.parse_args(argv))
@@ -101,6 +106,7 @@ def main(module, argv=None):
             require(operation is None or operation == request["operation"], "Operation differs from JSON input")
             operation, opts = request["operation"], request["params"]
         require(operation is not None, "Provide a subcommand or --input-json")
+        require(isinstance(opts, dict), "params must be an object")
         if module=="contract" and operation=="selector":
             require(isinstance(opts,dict) and set(opts)=={"signature"},"selector requires only signature")
             from .abi import selector
@@ -108,13 +114,15 @@ def main(module, argv=None):
             return 0
         analysis_only = module in ("events","address") or module == "raw" and operation=="patch" and not opts.get("wallet") or module == "chain" and operation == "probe" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
         analysis_only = analysis_only or module=="contract" and operation in ("functions","encode","introspect","diagnose")
+        analysis_only = analysis_only or module=="transaction" and operation=="plan" and not opts.get("wallet")
         config = Config(path=config_options.get("config"), env_file=config_options.get("env_file"), state_dir=config_options.get("state_dir"), load_wallets=not analysis_only)
         response = Toolkit(config).run(module, operation, opts)
     except (ParseError, ToolError) as exc:
-        response = result(module, error={"code": getattr(exc, "code", "INVALID_INPUT"),
-                                        "message": str(exc), "retryable": False})
-    except Exception:
-        response = result(module, error={"code": "INVALID_INPUT", "message": "Unable to process request", "retryable": False})
+        response = result(module, getattr(exc, "data", None), error={"code": getattr(exc, "code", "INVALID_INPUT"),
+                                        "message": str(exc), "retryable": getattr(exc,"retryable",False)})
+    except Exception as exc:
+        error = diagnostic_error(exc)
+        response = result(module, error.data, error={"code":error.code, "message":error.message, "retryable":error.retryable})
     if response.get("error") and "suggested_next" not in response["error"]:
         from .agent_output import suggested_next
         response["error"]["suggested_next"]=suggested_next({},response.get("data"),response["error"]["code"])

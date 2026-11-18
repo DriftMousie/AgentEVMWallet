@@ -190,6 +190,8 @@ class Engine:
             raise ToolError(exc.code,exc.message,retryable=exc.retryable,data={**output,**(exc.data or {})}) from None
         context.update(receipt=receipt,status="confirmed" if receipt["status"]==1 else "reverted",phase="complete")
         output.update(context)
+        output.pop("next", None)
+        output.pop("suggested_next", None)
         if receipt["status"]==1:output["minted_nfts"]=minted_nfts(receipt)
         self._journal_status(journal,context,"confirmed" if receipt["status"]==1 else "failed",output)
         if receipt["status"]==0:
@@ -212,12 +214,21 @@ class Engine:
         output.update(context)
         self._journal_status(journal,context,"broadcast",output)
 
+    def _confirmation_hint(self, output, params):
+        wait_params = {"chain":self.chain["alias"], "hash":output["hash"]}
+        if params.get("confirmations") is not None:
+            wait_params["confirmations"] = uint(params["confirmations"], "confirmations")
+        output["next"] = "Wait for confirmation of this hash before reading balances or submitting a dependent transaction."
+        output["suggested_next"] = [{"module":"transaction", "operation":"wait",
+                                    "params":wait_params, "reason":output["next"]}]
+
     @guarded_execution
     def send(self, wallet, to, value, data, params, *, erc20=False, replacement=False, context):
         to,value,data=address(to),uint(value,"value"),hexdata(data)
         execute=params.get("execute",False)
         require(isinstance(execute,bool),"execute must be boolean")
-        if params.get("wait"):wait_options(params.get("confirmations",self.chain["confirmations"]),params.get("timeout",120))
+        if params.get("wait") or params.get("confirmations") is not None:
+            wait_options(params.get("confirmations",self.chain["confirmations"]), params.get("timeout",120))
         if execute:require(wallet["account"] is not None,"Watch-only wallet cannot sign","WALLET_ERROR")
         skip=params.get("skip_simulation",False)
         if skip:require(params.get("gas") is not None and isinstance(params.get("reason"),str) and params["reason"].strip(),"Skipping simulation requires gas and a reason")
@@ -264,13 +275,15 @@ class Engine:
             try:journal.save(context["hash"],chain_id,sender,unsigned,"signed")
             except Exception:raise ToolError("JOURNAL_SAVE_FAILED","Cannot durably record the signed transaction; broadcasting was not attempted") from None
             self._broadcast(signed,context,journal,preview)
+            self._confirmation_hint(preview, params)
             if params.get("wait"):return self._wait(context,journal,preview,params)
             return preview
 
     @guarded_execution
     def replay(self, wallet, hash_, params, *, context):
         hash_=txhash(hash_)
-        if params.get("wait"):wait_options(params.get("confirmations",self.chain["confirmations"]),params.get("timeout",120))
+        if params.get("wait") or params.get("confirmations") is not None:
+            wait_options(params.get("confirmations",self.chain["confirmations"]), params.get("timeout",120))
         journal=Journal(self.config.state_dir);record=journal.get(hash_)
         require(record["chain_id"]==self.chain["chain_id"] and record["sender"]==wallet["address"],"Record does not match chain and wallet")
         context.update(hash=hash_,nonce=record["tx"]["nonce"],status="signed_not_broadcast")
@@ -291,5 +304,6 @@ class Engine:
                 context.update(already_known=True,status="broadcast_unconfirmed")
                 out.update(context);self._journal_status(journal,context,"broadcast",out)
             else:self._broadcast(signed,context,journal,out)
+            self._confirmation_hint(out, params)
             if params.get("wait"):return self._wait(context,journal,out,params)
             return out
