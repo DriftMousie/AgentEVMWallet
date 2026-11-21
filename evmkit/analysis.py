@@ -516,7 +516,7 @@ class Analyzer:
         self.memo["identity", target] = out
         return out
 
-    def internal_calls(self, hash_):
+    def internal_calls(self, hash_, *, decode_inputs=True):
         if not self.options["trace"]:
             return {"status": "disabled", "source": None, "complete": False, "calls": []}
         trace = self.attempt(lambda: self.query("debug_traceTransaction", [hash_, {"tracer": "callTracer", "timeout": "10s"}]), "CALL_TRACE")
@@ -543,8 +543,7 @@ class Analyzer:
                 item["is_value_transfer"] = item["may_carry_value"] and not failed and int(item["value_wei"]) > 0
                 from .calldata import input_fields
                 item.update(input_fields(item))
-                decoded = self.attempt(lambda: self.decode_input(item["input"], target, context=execution_context), "INTERNAL_DECODE")
-                item["decoded"] = decoded
+                item["decoded"] = self.attempt(lambda: self.decode_input(item["input"], target, context=execution_context), "INTERNAL_DECODE") if decode_inputs else None
                 rows.append(item)
                 children = frame.get("calls") or []
                 for index in range(len(children)-1, -1, -1):
@@ -568,7 +567,7 @@ class Analyzer:
             row["is_value_transfer"] = False if not row["may_carry_value"] or value == 0 or row["error"] else None
             from .calldata import input_fields
             row.update(input_fields(row))
-            if row["input"]:
+            if decode_inputs and row["input"]:
                 row["decoded"] = self.attempt(lambda: self.decode_input(row["input"], row["to"]), "INTERNAL_DECODE")
             rows.append(row)
         return {"status": "partial", "source": "blockscout.internal-transactions", "complete": False,

@@ -2,7 +2,7 @@
 import re
 import time
 from copy import deepcopy
-from .abi import canonical,decode_call,encode_call
+from .abi import canonical,decode_call,encode_call,load_abi
 from .common import ToolError,address,require,txhash,uint
 from .engine import Engine
 from .standards import V2_ROUTER
@@ -269,8 +269,9 @@ def _plan(tool,params,context):
     erc20=safe and signature in ("transfer(address,uint256)","transferFrom(address,address,uint256)","approve(address,uint256)") and "erc721" not in decoded.get("standards",[]) and not _token_id_fields(decoded)
     result["preview"] = None
     context.update(result, status="blocked")
-    try:result["preview"]=Engine(tool.config,chain,rpc).send(wallet,template["to"],int(value),data,live,erc20=erc20)
+    try:result["preview"]=Engine(tool.config,chain,rpc).send(wallet,template["to"],int(value),data,live,erc20=erc20,simulation_failover=True)
     except ToolError as exc:
+        tool.enrich_revert(exc, params, template["to"], load_abi(params["abi"]) if params.get("abi") is not None else None)
         result.update(status="blocked",simulation={"status":"failed","reason":exc.code,"details":exc.data},preview=None)
         raise ToolError(exc.code,exc.message,retryable=exc.retryable,data=result) from None
     result["simulation"] = result["preview"]["simulation"]

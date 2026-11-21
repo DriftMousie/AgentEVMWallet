@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from .common import ToolError, address, formatted, hexdata, jsonable, read_json,
 from .engine import Engine, Journal, fees, fee_summary, wait_receipt
 from .rpc import RPC
 from .error_details import check_dependencies, diagnostic_error
+from .position_math import MATH_FIELDS
 
 WRITE = {"execute", "gas", "gas_price_wei", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "skip_simulation", "reason", "wait", "timeout", "confirmations"}
 BASE = {"chain", "wallet"}
@@ -40,6 +42,8 @@ OPS = {
                  "selector":{"signature"},
                  "introspect":CONTRACT_INSPECTION,
                  "diagnose":CONTRACT_INSPECTION|{"amount","amount_raw","amount_unit","pattern"},
+                 "math": {"formula", "chain"} | set().union(*MATH_FIELDS.values()),
+                 "storage": {"chain", "contract", "block", "slot", "slot_hex", "mapping_key", "base_slot", "layout", "time_budget_seconds", "max_requests"},
                  "decode": {"abi", "data"},
                  "call": BASE | {"contract", "abi", "function", "args", "address", "block", "value_wei"}|CONTRACT_DISCOVERY,
                  "write": BASE | WRITE | {"contract", "abi", "function", "args", "value_wei"}},
@@ -57,7 +61,7 @@ OPS = {
             "mint": BASE | WRITE | {"contract", "abi", "function", "signature", "args", "value_wei"}},
     "events": {"read": {"chain", "contract", "from_block", "to_block", "topics", "abi", "chunk_size", "include_unconfirmed"} | ANALYSIS},
     "raw": {"encode": {"signature", "args"}, "decode": {"data", "signature", "abi", "output_types"},
-            "patch":{"chain","wallet","address","to","data","word","type","value","value_wei","verify"},
+            "patch":{"chain","wallet","address","to","data","word","type","value","value_wei","verify","from_trace","frame","set","abi"},
             "call": BASE | {"to", "data", "signature", "args", "value_wei", "address", "block", "output_types", "template"},
             "write": BASE | WRITE | {"to", "data", "signature", "args", "value_wei", "template"},
             "template": {"template"}, "reencode": {"template", "args", "output"}},
@@ -68,6 +72,11 @@ OPS = {
     "address": {"history":{"chain","address","limit","direction","to","cursor","no_cache","max_pages","max_requests","time_budget_seconds"},
                 "actions":{"chain","address","limit","direction","to","cursor","no_cache","max_pages","max_requests","time_budget_seconds"}},
 }
+
+for operations in OPS.values():
+    for fields in operations.values():
+        if "args" in fields:
+            fields.add("args_file")
 
 
 class Toolkit:
@@ -106,9 +115,30 @@ class Toolkit:
         _, rpc = self.rpc(p)
         require(rpc.read(lambda w: w.eth.get_code(address(target))), "Address has no contract code", "NO_CONTRACT")
 
-    def send(self, p, to, value=0, data="0x", erc20=False):
+    def send(self, p, to, value=0, data="0x", erc20=False, *, simulation_failover=False):
         chain, rpc = self.rpc(p)
-        return Engine(self.config, chain, rpc).send(self.wallet(p), to, value, data, p, erc20=erc20)
+        return Engine(self.config, chain, rpc).send(self.wallet(p), to, value, data, p, erc20=erc20,
+                                                     simulation_failover=simulation_failover)
+
+    def enrich_revert(self, error, params, target, abi=None):
+        details = error.data
+        if not isinstance(details, dict) or not details.get("revert_data"):
+            return
+        raw = details["revert_data"]
+        decoded = decode_revert(raw, abi)
+        if ((decoded["error_lookup"] == "not_found" or decoded.get("source") == "defi_static") and decoded["error_selector"]
+                and error.code in ("SIMULATION_REVERTED", "SIMULATION_INCONCLUSIVE", "CALL_REVERTED") and params.get("external", True)):
+            from .introspect import discover_abi
+            try:
+                verified, _ = discover_abi(self, {"chain":params["chain"], "contract":target,
+                                                  "no_cache":params.get("no_cache", False),
+                                                  "time_budget_seconds":10, "max_requests":12})
+            except Exception:
+                # Optional lookup cannot replace the primary execution diagnostic.
+                details["verified_abi_lookup"] = "unavailable"
+            else:
+                decoded = decode_revert(raw, verified, abi_source="contract_abi")
+        details.update(decoded)
 
     def amount(self, p, decimals):
         require((p.get("amount") is None) != (p.get("amount_raw") is None), "Provide exactly one of amount or amount_raw")
@@ -177,8 +207,19 @@ class Toolkit:
                         "Use wallet or address, not both")
             if params.get("wallet"):
                 wallet = self.config.public_wallet(self.config.wallet(params["wallet"]))
+            params = dict(params)
+            if "args_file" in params:
+                require("args" not in params, "Provide either args or args_file")
+                path = params.pop("args_file")
+                require(isinstance(path, str) and path, "args_file must be a local path")
+                try:
+                    args = json.loads(Path(path).read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    raise ToolError("INVALID_INPUT", "args_file must contain a readable UTF-8 JSON array") from None
+                require(isinstance(args, list), "args_file must contain a JSON array")
+                params["args"] = args
             method = getattr(self, module + "_" + operation.replace("-", "_"))
-            data = method(dict(params))
+            data = method(params)
             return result(name, data, chain_id=chain_id, wallet=wallet, warnings=self.config.warnings + self.warnings)
         except ToolError as exc:
             return result(name, exc.data, chain_id=chain_id, wallet=wallet, warnings=self.config.warnings + self.warnings,
@@ -493,6 +534,15 @@ class Toolkit:
         except Exception: raise ToolError("DECODE_ERROR", "Return data cannot be decoded") from None
         return {"return_data": output, "values": values}
 
+    def contract_math(self, p):
+        from .position_math import calculate
+        return calculate(p)
+
+    def contract_storage(self, p):
+        from .storage import read_storage
+        chain, rpc = self.rpc(p)
+        return read_storage(self.config, chain, rpc, p)
+
     def contract_write(self, p):
         abi = load_abi(p["abi"])
         item = resolve(abi, p["function"])
@@ -500,10 +550,9 @@ class Toolkit:
         require(item.get("stateMutability") == "payable" or value == 0, "Nonpayable function cannot receive value")
         self.contract_code(p, p["contract"])
         try:
-            return self.send(p, p["contract"], value, encode_call(canonical(item), p.get("args", [])))
+            return self.send(p, p["contract"], value, encode_call(canonical(item), p.get("args", [])), simulation_failover=True)
         except ToolError as exc:
-            if exc.data and exc.data.get("revert_data"):
-                exc.data.update(decode_revert(exc.data["revert_data"], abi))
+            self.enrich_revert(exc, p, p["contract"], abi)
             raise
 
     def transfer_native(self, p):
@@ -617,18 +666,79 @@ class Toolkit:
     def raw_patch(self,p):
         from .calldata import patch_word
         require(p.get("verify") is True,"raw.patch requires --verify (or verify=true); patching without simulation is not supported")
-        chain,rpc=self.rpc(p);sender=self.owner(p);target=address(p["to"])
-        patched,diff=patch_word(p["data"],p["word"],p["value"],p.get("type","bytes32"))
-        value=uint(p.get("value_wei","0"),"value_wei")
+        require(("wallet" in p) != ("address" in p) and (p.get("wallet") or p.get("address")),
+                "Provide an explicit wallet or address for verification")
+        trace = "from_trace" in p or "frame" in p
+        if trace:
+            require({"from_trace", "frame"} <= p.keys() and not {"data", "to"} & p.keys(),
+                    "Use from_trace and frame together, or provide data and to")
+            require(isinstance(p["frame"], str) and not p["frame"].startswith("execution:"),
+                    "frame must be a trace path or a full address:selector")
+        else:
+            require({"data", "to"} <= p.keys(), "Provide data and to, or use from_trace and frame")
+        if "set" in p:
+            require(not {"word", "type", "value"} & p.keys(), "Batch set cannot be combined with word, type or value")
+            require(isinstance(p["set"], list) and 1 <= len(p["set"]) <= 128, "Provide between 1 and 128 set entries")
+            edits = []
+            for entry in p["set"]:
+                match = re.fullmatch(r"([0-9]+)(?::(address|bytes32|uint256))?=([^=]+)", entry) if isinstance(entry, str) else None
+                require(match is not None, "Use --set INDEX[:TYPE]=VALUE")
+                index, kind, replacement = match.groups()
+                if kind is None:
+                    kind = "address" if re.fullmatch(r"0x[0-9a-fA-F]{40}", replacement) else "bytes32" if re.fullmatch(r"0x[0-9a-fA-F]{64}", replacement) else "uint256"
+                edits.append((uint(index, "word index"), replacement, kind))
+        else:
+            require({"word", "value"} <= p.keys(), "Provide word and value or at least one set entry")
+            edits = [(uint(p["word"], "word index"), p["value"], p.get("type", "bytes32"))]
+        indices = {index for index, _, _ in edits}
+        require(len(indices) == len(edits), "A calldata word may only be edited once")
+        chain,rpc=self.rpc(p);sender=self.owner(p)
+        source = {"chain_id":chain["chain_id"], "sender":sender, "kind":"raw_patch"}
+        source_value = "0"
+        if trace:
+            from .analysis import Analyzer
+            from .planning import select_call
+            hash_ = txhash(p["from_trace"])
+            inspected = self.transaction_inspect({"chain":chain["alias"], "hash":hash_})
+            require(inspected["status"] == "success", "Source transaction must have a canonical successful receipt", "CALL_NOT_COMMITTED")
+            analyzer = Analyzer(self.config, chain, rpc, {"trace":True, "external":False}, inspected)
+            calls = analyzer.internal_calls(hash_, decode_inputs=False)
+            require(calls.get("source") == "rpc.callTracer",
+                    "raw.patch from_trace needs an observed callTracer frame", "CALL_TRACE_UNAVAILABLE")
+            frame = select_call({"inspection":inspected, "internal_calls":calls}, p["frame"])
+            target, original = address(frame["to"]), hexdata(frame["input"])
+            source_value = frame["value_wei"]
+            source.update(hash=hash_, call_path=frame["path"], trace_from=frame.get("from"))
+        else:
+            target, original = address(p["to"]), hexdata(p["data"])
+        abi = load_abi(p["abi"]) if "abi" in p else None
+        patched, diffs = original, []
+        for index, replacement, kind in sorted(edits):
+            patched, diff = patch_word(patched, index, replacement, kind)
+            diffs.append(diff)
+        before, after = bytes.fromhex(original[2:]), bytes.fromhex(patched[2:])
+        cursor = 0
+        unchanged = len(before) == len(after)
+        for diff in diffs:
+            offset = diff["byte_offset"]
+            unchanged = unchanged and before[cursor:offset] == after[cursor:offset]
+            cursor = offset + 32
+        tail_unchanged = before[cursor:] == after[cursor:]
+        require(unchanged and tail_unchanged, "Patch changed bytes outside the selected words", "INTERNAL_ERROR")
+        proof = {"selector_unchanged":before[:4] == after[:4], "length_unchanged":len(before) == len(after),
+                 "unedited_bytes_unchanged":True, "tail_offset_bytes":cursor, "tail_bytes":len(before) - cursor}
+        value=uint(p.get("value_wei",source_value),"value_wei")
         notes=["payload_unverified: whole-word edits do not prove ABI structure or business semantics", "A successful eth_call is not a guarantee of intended effects or future execution"]
-        template={"schema_version":1,"source":{"chain_id":chain["chain_id"],"sender":sender,"kind":"raw_patch"},"to":target,"value_wei":str(value),
+        template={"schema_version":1,"source":source,"to":target,"value_wei":str(value),
                   "data":patched,"decoded":{"status":"unknown","selector":patched[:10]},"payload_unverified":True,"warnings":notes}
-        out={"status":"verified_preview","data":patched,"payload_unverified":True,"parameter_diff":[diff],"template":template,
+        out={"status":"verified_preview","data":patched,"payload_unverified":True,"parameter_diff":diffs,"template":template,
+             "tail_unchanged":tail_unchanged,"patch_proof":proof,
              "verification":{"status":"pending","from":sender,"to":target,"value_wei":str(value),"block":"pending"},"warnings":notes}
         try:
             returned=rpc.read(lambda w:w.eth.call({"from":sender,"to":target,"value":value,"data":patched},"pending"))
             out["verification"].update(status="success",return_data=jsonable(returned))
         except ToolError as exc:
+            self.enrich_revert(exc, {**p, "external":False}, target, abi)
             out["status"]="blocked";out["verification"].update(status="failed",reason=exc.code,details=exc.data)
             code="SIMULATION_REVERTED" if exc.code=="CALL_REVERTED" else exc.code
             out["verification"]["reason"]=code

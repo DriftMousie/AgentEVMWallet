@@ -6,7 +6,7 @@ from web3 import Web3
 def suggested_next(params, data=None, code=None):
     params=params if isinstance(params,dict) else {}
     data=data if isinstance(data,dict) else {}
-    chain,hash_=params.get("chain"),data.get("hash") or params.get("hash")
+    chain,hash_=params.get("chain"),data.get("hash") or params.get("hash") or params.get("from_trace")
     steps=[]
     if code == "DEPENDENCY_MISSING":
         steps.append({"action":"install_project_dependencies", "command":"python -m pip install -r requirements.txt",
@@ -22,6 +22,22 @@ def suggested_next(params, data=None, code=None):
                       "reason":"Query the known original hash; a confirmation error does not authorize another send"})
     if code=="BROADCAST_UNKNOWN" and chain and data.get("previous_hash"):
         steps.append({"module":"transaction","operation":"inspect","params":{"chain":chain,"hash":data["previous_hash"]},"reason":"Resolve the earlier recorded transaction before preparing a new one"})
+    error_details = data
+    for name in ("simulation", "verification"):
+        stage = data.get(name)
+        if isinstance(stage, dict) and isinstance(stage.get("details"), dict):
+            error_details = stage["details"]
+            break
+    if error_details.get("error_lookup") == "not_found" and error_details.get("error_selector"):
+        steps.append({"action":"load_verified_error_abi",
+                      "reason":"Get the verified contract ABI, including its error entries, from Etherscan, Blockscout or Sourcify. If the call forwarded the error, check the inner target ABI and retry in preview mode."})
+    if code == "SIMULATION_INCONCLUSIVE":
+        steps.append({"action":"retry_readonly_preview",
+                      "reason":"Check the backup RPC and confirmation of prerequisite transactions, then repeat the preview without executing."})
+    if "layout" in params or any(key in params for key in ("slot", "slot_hex", "mapping_key", "base_slot")):
+        if code in ("SOURCE_UNAUTHORIZED","SOURCE_UNAVAILABLE","OPTIONAL_RPC_REJECTED","CANONICALITY_UNAVAILABLE"):
+            steps.append({"action":"check_storage_rpc", "files":["config/rpc.csv"],
+                          "reason":"Use an enabled RPC that supports eth_getStorageAt at the requested height; older blocks may require archive access."})
     if code in ("TOKEN_ID_AUTO_UNSUPPORTED","UNSUPPORTED_OVERRIDE"):
         steps.append({"action":"check_nft_creation_interface","reason":"Use a confirmed creation ABI; contract-assigned IDs are read from the successful receipt. Existing NFT IDs and lock units must be supplied explicitly"})
     if code in ("CONTEXT_DEPENDENT_CALL","CALL_SELECTION_AMBIGUOUS","CALL_NOT_FOUND","CALL_INPUT_UNAVAILABLE","CALL_CONTEXT_UNSUPPORTED"):

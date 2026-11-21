@@ -14,4 +14,4 @@ else:
                 require(isinstance(params,dict) and set(params)=={'signature'},'selector requires only signature')
                 return result('contract.selector',{'signature':params['signature'],'selector':selector(params['signature'])})
             except ToolError as exc:return result('contract.selector',error={'code':exc.code,'message':exc.message,'retryable':False})
-        return Toolkit(config or Config(load_wallets=operation not in {'functions','encode','introspect','diagnose'})).run("contract", operation, params)
+        return Toolkit(config or Config(load_wallets=operation not in {'functions','encode','introspect','diagnose','math','storage'})).run("contract", operation, params)

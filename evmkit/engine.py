@@ -199,10 +199,10 @@ class Engine:
             raise ToolError("EXECUTION_REVERTED", "Canonical confirmed receipt reports execution failure",data=output)
         return output
 
-    def _broadcast(self, signed, context, journal, output):
+    def _broadcast(self, signed, context, journal, output, endpoint=None):
         context.update(phase="broadcast",broadcast_attempted=True,status="broadcast_unknown")
         try:
-            returned=self.rpc.send(signed.raw_transaction)
+            returned = self.rpc.send(signed.raw_transaction, endpoint=endpoint) if endpoint else self.rpc.send(signed.raw_transaction)
             require(Web3.to_hex(returned).lower()==context["hash"].lower(), "RPC returned an unexpected transaction hash", "BROADCAST_UNKNOWN")
         except Exception as exc:
             if isinstance(exc,ToolError) and isinstance(exc.data,dict) and exc.data.get("broadcast_attempted") is False:
@@ -223,7 +223,7 @@ class Engine:
                                     "params":wait_params, "reason":output["next"]}]
 
     @guarded_execution
-    def send(self, wallet, to, value, data, params, *, erc20=False, replacement=False, context):
+    def send(self, wallet, to, value, data, params, *, erc20=False, replacement=False, simulation_failover=False, context):
         to,value,data=address(to),uint(value,"value"),hexdata(data)
         execute=params.get("execute",False)
         require(isinstance(execute,bool),"execute must be boolean")
@@ -253,17 +253,44 @@ class Engine:
             context["phase"]="fees";tx.update(fees(self.rpc,self.chain,params))
             simulation={"status":"skipped","reason":params.get("reason")} if skip else {}
             call_tx={k:v for k,v in tx.items() if k not in ("nonce","chainId","type")}
-            if not skip:
+            def preflight(read):
                 context["phase"]="simulation"
-                output=self.rpc.read(lambda w:w.eth.call(call_tx,"pending"))
+                output=read(lambda w:w.eth.call(call_tx,"pending"))
                 if erc20 and output:require(len(output)==32 and int.from_bytes(output,"big")==1,"ERC-20 operation returned false or invalid data","TOKEN_OPERATION_FAILED")
-                simulation={"status":"success","return_data":jsonable(output)}
-            context["phase"]="gas_estimation"
-            gas=uint(params["gas"],"gas") if params.get("gas") is not None else (self.rpc.read(lambda w:w.eth.estimate_gas(call_tx))*120+99)//100
+                return output, estimate(read)
+
+            def estimate(read):
+                context["phase"]="gas_estimation"
+                if params.get("gas") is not None:
+                    return uint(params["gas"],"gas")
+                return (read(lambda w:w.eth.estimate_gas(call_tx))*120+99)//100
+
+            endpoint = None
+            read = self.rpc.read
+            if skip:
+                gas = estimate(read)
+            else:
+                retry = {}
+                if simulation_failover and hasattr(self.rpc, "simulate"):
+                    (output, gas), retry = self.rpc.simulate(lambda client: preflight(lambda fn: fn(client)))
+                    endpoint = retry.get("retried_on")
+                else:
+                    output, gas = preflight(read)
+                simulation = {"status":"success", "return_data":jsonable(output), **retry}
+                if endpoint:
+                    def read(fn):
+                        return self.rpc.read(fn, endpoint=endpoint)
+
+                    context["phase"] = "nonce"
+                    pending = read(lambda w:w.eth.get_transaction_count(sender,"pending"))
+                    context["pending_nonce_before"] = pending
+                    if not replacement:
+                        nonce = journal.next_nonce(chain_id,sender,pending) if journal else pending
+                        tx["nonce"] = context["nonce"] = nonce
             require(gas>0,"Gas must be positive");tx["gas"]=gas
             context["phase"]="balance"
             unit_fee=tx.get("maxFeePerGas",tx.get("gasPrice"))
-            balance=self.rpc.read(lambda w:w.eth.get_balance(sender,"pending"))
+            balance=read(lambda w:w.eth.get_balance(sender,"pending"))
             require(balance>=value+gas*unit_fee,"Insufficient native balance for value and execution fee cap","INSUFFICIENT_BALANCE")
             preview={"transaction":tx,"fee_summary":fee_summary(tx),"simulation":simulation,"execution_fee_cap_wei":str(gas*unit_fee),
                      "fee_scope":"EVM execution only; chain-specific L1/data fees are not included","status":"preview"}
@@ -274,7 +301,7 @@ class Engine:
             context.update(hash=Web3.to_hex(signed.hash),status="signed_not_broadcast",phase="journal_save")
             try:journal.save(context["hash"],chain_id,sender,unsigned,"signed")
             except Exception:raise ToolError("JOURNAL_SAVE_FAILED","Cannot durably record the signed transaction; broadcasting was not attempted") from None
-            self._broadcast(signed,context,journal,preview)
+            self._broadcast(signed,context,journal,preview,endpoint)
             self._confirmation_hint(preview, params)
             if params.get("wait"):return self._wait(context,journal,preview,params)
             return preview

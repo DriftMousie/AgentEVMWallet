@@ -454,14 +454,19 @@ amount 简写在这些已确认创建接口中对应第一个 uint256。两参�
 ```bash
 python raw.py patch --chain sepolia --to "$CONTRACT" --address "$OWNER" \
   --data "$CALLDATA" --word 6 --type address --value "$RECIPIENT" --verify
+python raw.py patch --chain sepolia --from-trace "$TX_HASH" --frame path:0.4 \
+  --set "0:address=$RECIPIENT" --set 1=2000000000000000 --set 2=59858606 \
+  --address "$OWNER" --verify
 python raw.py patch --describe
 python contract.py introspect --describe
 python contract.py diagnose --describe
 ```
 
-word 从 selector 后第一格的 0 开始，byte_offset=4+word×32。--type address 左补零到 32 字节；uint256 接受十进制整数或 hex 数量，检查范围；默认 bytes32 必须正好 32 字节，不能把 20 字节值暗自当地址。只替换已存在的完整 word，不改 selector、不插入/删除、不补齐半个尾部 word。
+word 从 selector 后第一格的 0 开始，`byte_offset=4+word×32`。单槽参数默认 `bytes32`，可显式指定 `address`、`uint256` 或 `bytes32`。多槽 `--set INDEX[:TYPE]=VALUE` 可重复，但每个索引只允许一次。省略类型时，20 字节十六进制按地址、32 字节按 bytes32、其余按 uint256 解析。`uint256` 接受十进制和十六进制。补丁只能替换现有的完整 word。
 
-必须 verify=true 并提供 chain、to、wallet 或公开 address（二选一）；value 是被改的 word，value_wei 是模拟发送的原生币。使用 pending 状态 eth_call，成功只代表该调用未 revert，不证明 ABI、业务意图或未来上链安全。始终 payload_unverified=true，保留 data、parameter_diff、verification、标准 template。失败 ok=false/status=blocked，仍保留候选数据和 details；此命令不接受 execute，绝不签名广播。
+必须提供链、钱包或公开发送地址（二选一）和 `--verify`。来源可用 `--data` + `--to`，或 `--from-trace` + `--frame`。trace 来源要求成功交易中的已生效普通 CALL；可传 `path:0.4` 或完整地址与 selector，后者要求完整 trace 且匹配唯一。`--value-wei` 指定模拟金额，省略时沿用帧的 value，直接输入默认 0。
+
+所有改动合并做一次 pending `eth_call` 验证。`parameter_diff` 记录每个改动的索引、偏移和前后字节。`patch_proof` 检查 selector、长度与全部未编辑字节，`tail_unchanged` 校验最后一个被替换 word 之后的原始后缀。证明仅覆盖字节位置。`payload_unverified=true` 始终保留，合约回退时仍返回候选 calldata、diff 和错误细节。`--abi` 可补充错误解码，模拟成功只表示当次调用未回退。该命令仅提供预览。
 
 带 payload_unverified 的模板交给 raw.write 后仍保留该标记和警告，并按原交易引擎再次实时模拟。CLI/SDK 使用公开 address 时不需要加载私钥。
 

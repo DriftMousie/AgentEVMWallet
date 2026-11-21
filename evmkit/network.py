@@ -22,6 +22,7 @@ class Budget:
         self.phase = "other"
         self.by_stage = {}
         self.validated_rpcs = set()
+        self.last_rpc_name = None
         self.reserve_requests = 0
         self.rpc_calls = 0
         self.rpc_by_method = {}

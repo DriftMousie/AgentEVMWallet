@@ -274,3 +274,11 @@ Skill 保留在项目内，用户决定安装位置，不自动修改全局 Herm
 - full/summary 共用资金结论，旧缓存补齐。历史记录增加内置签名候选及歧义，真实 trace 带 depth，声明及无层级列表保留未知深度。
 - introspect 与 diagnose 共用模式匹配，patterns_status 说明证据完整度。include-inputs 可展开低置信度 word 提示，保持原始输入且不参与改写。
 - 已广播未确认的写入输出带原 hash 的等待建议。CLI 和 Agent 文档说明 wait、确认数与余额读取顺序。
+
+## 17. DeFi 构造与预检反馈修订
+
+- 扩展本地 DeFi 错误布局，预检也可按目标的已验证有效 ABI 解码。保留原始错误、来源和歧义，未知 selector 返回后续查证建议。
+- `contract.write` 和 `transaction.plan` 在明确回退后可换一个独立 RPC 重试预检。输出两方证据并区分一致回退、备用通过及预检未能完成。通过备用预检后在该节点核对 nonce、余额和执行提交，广播仅一次。
+- `contract.math` 离线计算 V3/V4 tick、Q64.96 价格、流动性和本金。预算模式向下取流动性、向上取所需本金。`contract.storage` 在固定区块读取显式 storage 槽和位布局。
+- `raw.patch` 从已提交的 callTracer 普通 CALL 或直接提供的 calldata 取数。支持多槽批量、一轮 `eth_call` 校验、逐字节保留证据。继续兼容单槽参数。
+- 接收 `args` 的入口支持互斥的 `args_file`，静态 `--describe` 输出 `accepted_fields`。保持 13 个顶层入口。

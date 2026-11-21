@@ -59,12 +59,13 @@ class RPC:
         require(self.clients, "No enabled RPC URL for this chain in CSV", "CONFIG_ERROR")
         self.active = None
 
-    def read(self, fn):
+    def read(self, fn, *, endpoint=None):
         mismatch = False
         last_not_found = False
         rejected = None
-        for _ in range(2):
-            for _, client in self.clients:
+        clients = self.clients if endpoint is None else [(name, client) for name, client in self.clients if name == endpoint]
+        for _ in range(2 if endpoint is None else 1):
+            for name, client in clients:
                 try:
                     if client.eth.chain_id != self.chain["chain_id"]:
                         mismatch = True
@@ -74,6 +75,8 @@ class RPC:
                     return value
                 except TransactionNotFound:
                     last_not_found = True
+                except ToolError:
+                    raise
                 except (ContractLogicError, ValueError, Web3RPCError) as exc:
                     # Never echo RPC exceptions: providers may include URLs, requests or credentials.
                     response = getattr(exc, "rpc_response", None)
@@ -90,12 +93,12 @@ class RPC:
                     raw = getattr(exc, "data", None)
                     if raw is None and isinstance(error, dict):
                         raw = error.get("data")
-                    details = None
+                    details = {"rpc_name":name}
                     raw=revert_bytes(raw)
                     if raw is not None:
                         from .common import hexdata
                         try:
-                            details = {"revert_data": hexdata(raw)}
+                            details["revert_data"] = hexdata(raw)
                             from .abi import decode_revert
                             details.update(decode_revert(raw))
                         except ToolError:
@@ -103,7 +106,8 @@ class RPC:
                     raise ToolError("CALL_REVERTED", "EVM read execution reverted", data=details) from None
                 except Exception:
                     continue
-            time.sleep(0.1)
+            if endpoint is None:
+                time.sleep(0.1)
         if rejected is not None:
             raise ToolError("RPC_REQUEST_REJECTED", "RPC rejected a read request; no contract execution failure has been established", data=rejected)
         if last_not_found:
@@ -111,13 +115,59 @@ class RPC:
         raise ToolError("CHAIN_ID_MISMATCH" if mismatch else "RPC_UNAVAILABLE",
                         "No reachable RPC with the expected Chain ID", retryable=not mismatch)
 
-    def send(self, raw):
+    def simulate(self, fn):
+        """Try a single alternate RPC after an explicit EVM revert."""
+        try:
+            return self.read(fn), {}
+        except ToolError as original:
+            if original.code != "CALL_REVERTED":
+                raise
+            details = dict(original.data or {})
+            primary = details.get("rpc_name")
+            primary_client = next((client for name, client in self.clients if name == primary), None)
+            primary_url = getattr(getattr(primary_client, "provider", None), "endpoint_uri", None)
+            peer = next((name for name, client in self.clients
+                         if name != primary and client is not primary_client
+                         and (primary_url is None or getattr(getattr(client, "provider", None), "endpoint_uri", None) != primary_url)), None)
+            if primary_client is None:
+                raise
+            if peer is None:
+                raise
+            retry = {"retried_on":peer, "primary_rpc":primary,
+                     "primary_revert":dict(details), "revert_consensus":None}
+            try:
+                value = self.read(fn, endpoint=peer)
+            except ToolError as secondary:
+                if secondary.code == "CALL_REVERTED":
+                    retry["revert_consensus"] = True
+                    retry["secondary_revert"] = secondary.data
+                    a, b = details.get("revert_data"), (secondary.data or {}).get("revert_data")
+                    retry["revert_payload_agreement"] = a == b if a is not None and b is not None else None
+                else:
+                    retry["retry_error"] = secondary.code
+                details.update(retry)
+                if retry["revert_consensus"] is None:
+                    raise ToolError("SIMULATION_INCONCLUSIVE", "First RPC reported a revert; the backup could not complete preflight",
+                                    retryable=secondary.retryable, data=details) from None
+                raise ToolError(original.code, original.message, data=details) from None
+            retry["revert_consensus"] = False
+            return value, retry
+
+    def send(self, raw, *, endpoint=None):
         # Pick a validated endpoint without accidentally retrying a write.
-        try:self.read(lambda w: w.eth.block_number)
+        def ready(client):
+            client.eth.block_number
+            return client
+
+        try:
+            if endpoint is None:
+                client = self.read(ready)
+            else:
+                client = self.read(ready, endpoint=endpoint)
         except ToolError as exc:
             raise ToolError(exc.code,exc.message,retryable=exc.retryable,data={"broadcast_attempted":False}) from None
         try:
-            return self.active.eth.send_raw_transaction(raw)
+            return client.eth.send_raw_transaction(raw)
         except Exception:
             raise ToolError("BROADCAST_UNKNOWN", "Broadcast outcome unknown; query the recorded hash before replaying", retryable=False) from None
 
@@ -155,6 +205,7 @@ class RPC:
                     last_details = optional_failure(response["error"])
                     continue
                 require("result" in response and response["result"] is not None, "Optional RPC returned no result", "SOURCE_NOT_FOUND")
+                budget.last_rpc_name = name
                 return response["result"]
             except ToolError as exc:
                 if exc.code == "ANALYSIS_LIMIT": raise

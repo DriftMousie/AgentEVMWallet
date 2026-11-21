@@ -182,15 +182,44 @@ PANICS={0x00:"Compiler-inserted panic",0x01:"Assertion failed",0x11:"Arithmetic 
         0x12:"Division or modulo by zero",0x21:"Invalid enum conversion",0x22:"Invalid storage byte array encoding",
         0x31:"Pop on empty array",0x32:"Array index out of bounds",0x41:"Memory allocation overflow",0x51:"Uninitialized function pointer"}
 
+# Sources: Uniswap Universal Router, Permit2 interfaces, v4-core IPoolManager,
+# and v4-periphery's SlippageCheck, IV4Router, DeltaResolver and IPositionManager.
+DEFI_ERRORS = [
+    ("SliceOutOfBounds", []), ("LengthMismatch", []), ("ETHNotAccepted", []),
+    ("InvalidEthSender", []), ("TransactionDeadlinePassed", []), ("BalanceTooLow", []),
+    ("ExecutionFailed", [("commandIndex","uint256"), ("message","bytes")]),
+    ("InvalidCommandType", [("commandType","uint256")]),
+    ("InvalidAction", [("action","bytes4")]),
+    ("AllowanceExpired", [("deadline","uint256")]),
+    ("InsufficientAllowance", [("amount","uint256")]), ("ExcessiveInvalidation", []),
+    ("MaximumAmountExceeded", [("maximumAmount","uint128"), ("amountRequested","uint128")]),
+    ("MinimumAmountInsufficient", [("minimumAmount","uint128"), ("amountReceived","uint128")]),
+    ("V3InvalidSwap", []), ("V3TooLittleReceived", []), ("V3TooMuchRequested", []),
+    ("V3InvalidAmountOut", []), ("V3InvalidCaller", []),
+    ("V4TooLittleReceived", [("minAmountOutReceived","uint256"), ("amountReceived","uint256")]),
+    ("V4TooMuchRequested", [("maxAmountInRequested","uint256"), ("amountRequested","uint256")]),
+    ("CurrencyNotSettled", []), ("PoolNotInitialized", []), ("AlreadyUnlocked", []), ("ManagerLocked", []),
+    ("TickSpacingTooLarge", [("tickSpacing","int24")]), ("TickSpacingTooSmall", [("tickSpacing","int24")]),
+    ("CurrenciesOutOfOrderOrEqual", [("currency0","address"), ("currency1","address")]),
+    ("UnauthorizedDynamicLPFeeUpdate", []), ("SwapAmountCannotBeZero", []),
+    ("NonzeroNativeValue", []), ("MustClearExactPositiveDelta", []),
+    ("DeltaNotPositive", [("currency","address")]), ("DeltaNotNegative", [("currency","address")]),
+    ("InsufficientBalance", []), ("UnsupportedAction", [("action","uint256")]),
+    ("InputLengthMismatch", []), ("NotApproved", [("caller","address")]),
+    ("DeadlinePassed", [("deadline","uint256")]), ("PoolManagerMustBeLocked", []),
+]
 
-def decode_revert(data, abi=None):
+
+def decode_revert(data, abi=None, *, abi_source="explicit_abi"):
     data=hexdata(data)
-    base={"revert_data":data,"error_selector":data[:10] if len(data)>=10 else None,"error_signature":None,"error_candidates":[]}
+    base={"revert_data":data,"error_selector":data[:10] if len(data)>=10 else None,"error_signature":None,"error_candidates":[],"error_lookup":"not_found"}
     if len(data)<10 or len(data)>131074:return base
-    candidates=[(item,"explicit_abi") for item in abi or [] if item.get("type")=="error"]
+    candidates=[(item,abi_source) for item in abi or [] if item.get("type")=="error"]
     for name,fields in [("Error",[("reason","string")]),("Panic",[("code","uint256")])]+STANDARD_ERRORS:
         candidates.append(({"type":"error","name":name,"inputs":[{"name":n,"type":t} for n,t in fields]},"solidity_builtin" if name in ("Error","Panic") else "erc6093"))
     candidates.append(({"type":"error","name":"Expired","inputs":[]},"name_pattern"))
+    for name, fields in DEFI_ERRORS:
+        candidates.append(({"type":"error", "name":name, "inputs":[{"name":n,"type":t} for n,t in fields]}, "defi_static"))
     seen=set()
     for item,source in candidates:
         try:
@@ -206,13 +235,18 @@ def decode_revert(data, abi=None):
             if item["name"]=="Error":explanation=str(values[0])
             elif item["name"]=="Panic":explanation=PANICS.get(int(values[0]),"Unknown Solidity panic code")
             elif signature=="ERC20InsufficientAllowance(address,uint256,uint256)":explanation=f"ERC-20 allowance is insufficient: spender {values[0]}, allowance {values[1]}, needed {values[2]} (raw token units)"
-            elif "InsufficientBalance" in item["name"]:explanation="Token balance is insufficient; compare balance and needed in raw token units"
+            elif "InsufficientBalance" in item["name"]:explanation="Balance is insufficient; check the relevant account or router balance in raw units"
+            elif signature=="AllowanceExpired(uint256)":explanation=f"Allowance expiration timestamp: {values[0]}; check the token, owner, spender and current approval state"
+            elif signature=="MaximumAmountExceeded(uint128,uint128)":explanation=f"Requested principal {values[1]} exceeds maximum {values[0]} (raw units)"
+            elif signature=="MinimumAmountInsufficient(uint128,uint128)":explanation=f"Received {values[1]} below minimum {values[0]} (raw units)"
+            elif signature=="SliceOutOfBounds()":explanation="Calldata slice exceeds its available bytes; check the expected input layout and offsets"
             elif signature=="Expired()":explanation="An expiry check failed; the selector alone does not identify which deadline or condition expired"
             elif "Approval" in item["name"]:explanation="NFT approval is missing or the operator is not authorized"
             elif item["name"]=="ERC721IncorrectOwner":explanation="The supplied NFT sender does not own this tokenId"
             else:explanation=item["name"]+": inspect the decoded named arguments"
             row["error_explanation"]=explanation;base["error_candidates"].append(row)
         except Exception:continue
-    if len(base["error_candidates"])==1:base.update(base["error_candidates"][0])
-    elif base["error_candidates"]:base["error_explanation"]="Multiple error layouts match; preserve all candidates rather than choosing one"
+    if len(base["error_candidates"])==1:base.update(base["error_candidates"][0], error_lookup="matched")
+    elif base["error_candidates"]:
+        base.update(error_lookup="ambiguous", error_explanation="Multiple error layouts match; inspect all candidates")
     return base

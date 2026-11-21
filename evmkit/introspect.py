@@ -38,6 +38,7 @@ class Inspector:
     def __init__(self,config,chain,rpc,params):
         self.config,self.chain,self.rpc,self.params=config,chain,rpc,params
         self.limits=options(params);self.budget=Budget(self.limits['time_budget_seconds'],self.limits['max_requests'])
+        self.rpc_name = None
         self.sources=Sources(config,chain,self.budget,enabled=params.get('external',True),no_cache=params.get('no_cache',False))
         self.cache=SnapshotCache(config);self.nodes={};self.edges=[];self.issues=[];self.structures={};self.materials={};self.memo={};self.probes={};self.omitted_probes=0;self.files_used=0
         self.account=address(params['account']) if params.get('account') else None
@@ -49,7 +50,10 @@ class Inspector:
         self.block=hex(uint(hexnum(block['number']),'block number'));self.block_hash=txhash(block['hash']);self.checked_at=time.time();self.canonicality='unchecked'
         self.budget.reserve_requests=1
 
-    def query(self,method,params):return self.rpc.optional_request(method,params,self.budget)
+    def query(self,method,params):
+        if self.rpc_name is not None:
+            return self.rpc.optional_request(method, params, self.budget, rpc_name=self.rpc_name)
+        return self.rpc.optional_request(method, params, self.budget)
 
     def issue(self,capability,reason,where=None):
         row={'capability':capability,'source':'rpc' if capability in ('structure','probes','canonicality') else 'analysis','reason':reason}

@@ -41,12 +41,17 @@ def main(module, argv=None):
     runtime(parser)
     subs = parser.add_subparsers(dest="operation")
     for name, fields in OPS[module].items():
-        sub = subs.add_parser(name, help=f"{module}.{name}")
+        description = ("Reads live state at latest or pending; no --no-cache switch. Uses a local ABI for encoding."
+                       if (module, name) == ("contract", "write") else None)
+        sub = subs.add_parser(name, help=f"{module}.{name}", description=description)
         runtime(sub)
-        from .describe import SUPPORTED
-        if (module,name) in SUPPORTED: sub.add_argument("--describe",action="store_true",default=argparse.SUPPRESS,help="Static machine-readable JSON help; no configuration or network needed")
+        sub.add_argument("--describe",action="store_true",default=argparse.SUPPRESS,help="Static machine-readable JSON help; no configuration or network needed")
         for field in sorted(fields):
             kwargs = {"default": argparse.SUPPRESS}
+            if field == "formula":
+                from .position_math import FORMULAS
+                sub.add_argument("formula", nargs="?", choices=FORMULAS, **kwargs)
+                continue
             if field == "wallets":
                 sub.add_argument("--wallets", "--wallet", dest="wallets", action=WalletsAction,
                                  default=argparse.SUPPRESS, help='Wallet IDs/labels: trading,treasury or JSON ["trading","treasury"]')
@@ -62,6 +67,10 @@ def main(module, argv=None):
             elif field in JSON_FIELDS:
                 kwargs["type"] = json.loads
                 kwargs["help"] = "JSON object" if field in ("override","field_map") else "JSON array"
+            elif field == "args_file":
+                kwargs["help"] = "UTF-8 JSON array file; mutually exclusive with --args"
+            elif field == "set":
+                kwargs.update(action="append", metavar="INDEX[:TYPE]=VALUE", help="Set a whole calldata word; repeat for multiple edits")
             elif field=="type" and module=="raw" and name=="patch":kwargs["choices"]=["address","uint256","bytes32"]
             elif field == "view":
                 kwargs["choices"]=["summary","full"]
@@ -113,7 +122,7 @@ def main(module, argv=None):
             print(json.dumps(result('contract.selector',{'signature':opts['signature'],'selector':selector(opts['signature'])}),separators=(',',':')))
             return 0
         analysis_only = module in ("events","address") or module == "raw" and operation=="patch" and not opts.get("wallet") or module == "chain" and operation == "probe" or module == "transaction" and operation in {"analyze", "decode", "export-template", "inspect", "status", "wait", "gas"}
-        analysis_only = analysis_only or module=="contract" and operation in ("functions","encode","introspect","diagnose")
+        analysis_only = analysis_only or module=="contract" and operation in ("functions","encode","introspect","diagnose","math","storage")
         analysis_only = analysis_only or module=="transaction" and operation=="plan" and not opts.get("wallet")
         config = Config(path=config_options.get("config"), env_file=config_options.get("env_file"), state_dir=config_options.get("state_dir"), load_wallets=not analysis_only)
         response = Toolkit(config).run(module, operation, opts)
